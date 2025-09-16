@@ -25,8 +25,9 @@
         "ASSIGNMENTS": "/api/resource/Assignment",
         "DAILY_REPORTS": "/api/resource/Daily Report",
         "STUDENT_NOTES": "/api/resource/Student Notes",
-        "PROFILE": "/api/resource/Student",
-        "SIBLINGS": "/api/method/synte_edu_tech.api.get_siblings"
+        "PROFILE": "/api/method/education.education.api.get_student_info",
+        "SIBLINGS": "/api/method/synte_edu_tech.api.get_siblings",
+        "STUDENT_DOCTYPE": "/api/resource/students"
       }
     }
   ]
