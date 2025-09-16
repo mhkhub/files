@@ -20,7 +20,7 @@
         "SIBLINGS": "/api/method/synte_edu_tech.api.get_siblings",
         "STUDENT_DOCTYPE": "/api/resource/students"
       },
-  "SCHOOLS": [
+   "SCHOOLS": [
     {
       "NAME": "Mega School",
       "SLOGAN": "Excellence in Education",
