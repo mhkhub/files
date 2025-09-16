@@ -19,7 +19,7 @@
         "PROFILE": "/api/method/education.education.api.get_student_info",
         "SIBLINGS": "/api/method/synte_edu_tech.api.get_siblings",
         "STUDENT_DOCTYPE": "/api/resource/students"
-      }
+      },
   "SCHOOLS": [
     {
       "NAME": "Mega School",
