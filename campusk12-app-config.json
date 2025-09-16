@@ -2,16 +2,7 @@
   "APP": "CAMPUSk12",
   "APP_WELCOME_MESSAGE": "✅ Welcome to Parent Portal",
   "APP_SLOGAN": "Stay connected with your child's education",
-  "SCHOOLS": [
-    {
-      "NAME": "Mega School",
-      "SLOGAN": "Excellence in Education",
-      "VERSION": "1.0.0",
-      "SUPPORT_EMAIL": "support@campusk12.com",
-      "PRIVACY_URL": "https://campusk12.com/privacy",
-      "TERMS_URL": "https://campusk12.com/terms",
-      "DEFAULT_FONT": "Nunito_400Regular",
-      "ApiEndPoints": {
+   "ApiEndPoints": {
         "BASE": "https://megaschool.campusk12.com",
         "LOGIN": "/api/method/synte_edu_tech.api.login_and_get_keys",
         "STUDENT_PORTAL": "/student-portal",
@@ -29,6 +20,15 @@
         "SIBLINGS": "/api/method/synte_edu_tech.api.get_siblings",
         "STUDENT_DOCTYPE": "/api/resource/students"
       }
+  "SCHOOLS": [
+    {
+      "NAME": "Mega School",
+      "SLOGAN": "Excellence in Education",
+      "VERSION": "1.0.0",
+      "SUPPORT_EMAIL": "support@campusk12.com",
+      "PRIVACY_URL": "https://campusk12.com/privacy",
+      "TERMS_URL": "https://campusk12.com/terms",
+      "DEFAULT_FONT": "Nunito_400Regular"
     }
   ]
 }
