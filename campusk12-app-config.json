@@ -2,11 +2,10 @@
   "APP": "CAMPUSk12",
   "APP_WELCOME_MESSAGE": "✅ Welcome to Parent Portal",
   "APP_SLOGAN": "Stay connected with your child's education",
-   "ApiEndPoints": {
+  "ApiEndPoints": {
         "BASE": "https://megaschool.campusk12.com",
         "LOGIN": "/api/method/synte_edu_tech.api.login_and_get_keys",
         "ASSIGN_ROLE_TO_USER": "/api/method/synte_edu_tech.api.ensure_api_student_access_role",
-        "STUDENT_DOCTYPE": "/api/resource/Student"
         "STUDENT_PORTAL": "/student-portal",
         "ATTENDANCE": "/api/resource/Student Attendance",
         "GRADES": "/api/resource/Assessment Result",
@@ -21,8 +20,6 @@
         "PROFILE": "/api/method/education.education.api.get_student_info",
         "SIBLINGS": "/api/method/synte_edu_tech.api.get_siblings",
         "STUDENT_DOCTYPE": "/api/resource/student"
-        
-        
       },
    "SCHOOLS": [
     {
