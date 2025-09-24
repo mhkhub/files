@@ -1,35 +1,73 @@
 {
-  "APP": "CAMPUSk12",
-  "APP_WELCOME_MESSAGE": "✅ Welcome to Parent Portal",
-  "APP_SLOGAN": "Stay connected with your child's education",
-  "ApiEndPoints": {
-        "BASE": "https://megaschool.campusk12.com",
-        "LOGIN": "/api/method/synte_edu_tech.api.login_and_get_keys",
-        "ASSIGN_ROLE_TO_USER": "/api/method/synte_edu_tech.api.ensure_api_student_access_role",
-        "STUDENT_PORTAL": "/student-portal",
-        "ATTENDANCE": "/api/resource/Student Attendance",
-        "GRADES": "/api/resource/Assessment Result",
-        "FEES": "/api/resource/Fees",
-        "SCHEDULE": "/api/resource/Course Schedule",
-        "NOTICES": "/api/resource/Notice Board",
-        "BULLETINS": "/api/resource/Bulletin",
-        "CIRCULARS": "/api/resource/Circular",
-        "ASSIGNMENTS": "/api/resource/Assignment",
-        "DAILY_REPORTS": "/api/resource/Daily Report",
-        "STUDENT_NOTES": "/api/resource/Student Notes",
-        "PROFILE": "/api/method/education.education.api.get_student_info",
-        "SIBLINGS": "/api/method/synte_edu_tech.api.get_siblings",
-        "STUDENT_DOCTYPE": "/api/resource/Student"
-      },
-   "SCHOOLS": [
+  "SCHOOLS": [
     {
       "NAME": "Mega School",
-      "SLOGAN": "Excellence in Education",
+      "SLOGAN": "Excellence in Education", 
       "VERSION": "1.0.0",
-      "SUPPORT_EMAIL": "support@campusk12.com",
-      "PRIVACY_URL": "https://campusk12.com/privacy",
-      "TERMS_URL": "https://campusk12.com/terms",
-      "DEFAULT_FONT": "Nunito_400Regular"
+      "SUPPORT_EMAIL": "support@megaschool.edu",
+      "PRIVACY_URL": "https://megaschool.edu/privacy",
+      "TERMS_URL": "https://megaschool.edu/terms",
+      "DEFAULT_FONT": "Nunito_400Regular",
+      "LOGO_URL": "https://megaschool.edu/logo.png",
+      "PRIMARY_COLOR": "#3B82F6",
+      "SECONDARY_COLOR": "#10B981"
     }
-  ]
+  ],
+  "APP": "CampusK12",
+  "APP_WELCOME_MESSAGE": "Welcome to CampusK12 - Your School Portal",
+  "APP_SLOGAN": "Learn. Grow. Achieve.",
+  "SCHOOL": {
+    "NAME": "Mega School",
+    "SLOGAN": "Excellence in Education",
+    "VERSION": "1.0.0", 
+    "SUPPORT_EMAIL": "support@megaschool.edu",
+    "PRIVACY_URL": "https://megaschool.edu/privacy",
+    "TERMS_URL": "https://megaschool.edu/terms",
+    "DEFAULT_FONT": "Nunito_400Regular"
+  },
+  "ApiEndPoints": {
+    "BASE": "https://megaschool.campusk12.com",
+    "LOGIN": "/api/method/campusk12.api.login_and_get_keys",
+    "STUDENT_PORTAL": "/api/resource/Student",
+    "ATTENDANCE": "/api/method/campusk12.api.get_attendance_summary",
+    "GRADES": "/api/method/campusk12.api.get_recent_scores", 
+    "FEES": "/api/method/campusk12.api.get_fee_summary",
+    "SCHEDULE": "/api/method/campusk12.api.get_student_schedule",
+    "NOTICES": "/api/method/campusk12.api.get_announcements",
+    "BULLETINS": "/api/method/campusk12.api.get_announcements?announcement_type=Bulletin",
+    "CIRCULARS": "/api/method/campusk12.api.get_announcements?announcement_type=Circulars", 
+    "ASSIGNMENTS": "/api/method/campusk12.api.get_announcements?announcement_type=Assignments",
+    "DAILY_REPORTS": "/api/method/campusk12.api.get_announcements?announcement_type=Daily Report",
+    "STUDENT_NOTES": "/api/method/campusk12.api.get_announcements?announcement_type=Student Note",
+    "PROFILE": "/api/method/campusk12.api.get_student_profile",
+    "SIBLINGS": "/api/method/campusk12.api.get_siblings",
+    "STUDENT_DOCTYPE": "/api/resource/Student",
+    "ASSIGN_ROLE_TO_USER": "/api/method/campusk12.api.ensure_api_student_access_role",
+    "DASHBOARD_DATA": "/api/method/campusk12.api.get_dashboard_data",
+    "CREATE_ANNOUNCEMENT": "/api/method/campusk12.api.create_announcement",
+    "UPLOAD_FILE": "/api/method/campusk12.api.upload_file"
+  },
+  "VERSION": "1.0.0",
+  "FEATURES": {
+    "OFFLINE_MODE": false,
+    "BIOMETRIC_AUTH": true,
+    "PUSH_NOTIFICATIONS": true,
+    "DARK_MODE": true,
+    "MULTI_LANGUAGE": false,
+    "SIBLING_SWITCHING": true,
+    "FILE_UPLOAD": true,
+    "REAL_TIME_NOTIFICATIONS": true
+  },
+  "ENVIRONMENT": "production",
+  "CACHE_SETTINGS": {
+    "CONFIG_CACHE_MINUTES": 60,
+    "STUDENT_DATA_CACHE_MINUTES": 30,
+    "DASHBOARD_CACHE_MINUTES": 15
+  },
+  "UI_SETTINGS": {
+    "ANIMATION_DURATION": 300,
+    "REFRESH_THRESHOLD": 100,
+    "CARD_BORDER_RADIUS": 12,
+    "BUTTON_BORDER_RADIUS": 8
+  }
 }
