@@ -1,0 +1,655 @@
+/* ══════════ LAYER 1: DISCOVERY ENGINE V7.3 ══════════ */
+PRINT N'LAYER 1 ~ INITIALIZING ' + CONVERT(NVARCHAR(30),GETDATE(),121);
+GO
+USE MASTER;
+GO
+SET NOCOUNT ON; SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON;
+GO
+IF DB_ID(N'MasterMerge') IS NOT NULL BEGIN ALTER DATABASE MasterMerge SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE MasterMerge; END
+GO
+CREATE DATABASE MasterMerge;
+GO
+USE MasterMerge;
+GO
+PRINT N'LAYER 1 ~ DISCOVERY ENGINE: INITIALIZING ' + CONVERT(NVARCHAR(30),GETDATE(),121);
+GO
+
+-- ═══ HELPERS ═══
+CREATE OR ALTER FUNCTION dbo.fn_NormalizeSQL(@sql NVARCHAR(MAX)) RETURNS NVARCHAR(MAX) WITH RETURNS NULL ON NULL INPUT AS BEGIN
+DECLARE @s NVARCHAR(MAX)=@sql,@i INT,@j INT;
+WHILE 1=1 BEGIN SET @i=CHARINDEX(N'/*',@s); IF @i=0 BREAK; SET @j=CHARINDEX(N'*/',@s,@i+2); IF @j=0 BEGIN SET @s=LEFT(@s,@i-1); BREAK; END SET @s=STUFF(@s,@i,(@j-@i)+2,N' '); END
+WHILE 1=1 BEGIN SET @i=CHARINDEX(N'--',@s); IF @i=0 BREAK; SET @j=CHARINDEX(NCHAR(10),@s,@i); IF @j=0 SET @j=CHARINDEX(NCHAR(13),@s,@i); IF @j>0 SET @s=STUFF(@s,@i,(@j-@i),N' '); ELSE SET @s=LEFT(@s,@i-1); END
+SET @s=REPLACE(REPLACE(REPLACE(@s,NCHAR(9),N' '),NCHAR(13),N' '),NCHAR(10),N' ');
+WHILE CHARINDEX(N'  ',@s)>0 SET @s=REPLACE(@s,N'  ',N' '); RETURN UPPER(LTRIM(RTRIM(@s))); END
+GO
+CREATE OR ALTER FUNCTION dbo.fn_ObjectHash(@def NVARCHAR(MAX)) RETURNS VARBINARY(64) AS BEGIN RETURN HASHBYTES('SHA2_256',ISNULL(dbo.fn_NormalizeSQL(@def),N'')); END
+GO
+CREATE OR ALTER FUNCTION dbo.fn_NormalizeForHash(@def NVARCHAR(MAX)) RETURNS NVARCHAR(4000) WITH RETURNS NULL ON NULL INPUT AS BEGIN
+RETURN CAST(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER(@def),N'--'+NCHAR(10),N' '),N'--'+NCHAR(13),N' '),N'/*',N' '),N'*/',N' '),NCHAR(9),N' '),NCHAR(13),N' '),NCHAR(10),N' '),N'[',N''),N']',N'') AS NVARCHAR(4000)); END
+GO
+CREATE OR ALTER FUNCTION dbo.fn_NormalizeForSearch(@def NVARCHAR(MAX)) RETURNS NVARCHAR(MAX) WITH RETURNS NULL ON NULL INPUT AS BEGIN
+RETURN REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER(@def),N'--'+NCHAR(10),N' '),N'--'+NCHAR(13),N' '),N'/*',N' '),N'*/',N' '),NCHAR(9),N' '),NCHAR(13),N' '),NCHAR(10),N' '),N'[',N''),N']',N''),N'DBO.',N''),N'SALES.',N''),N'HR.',N''); END
+GO
+
+-- ═══ CONFIG ═══
+IF OBJECT_ID('dbo.DiscoveryConfig','U') IS NOT NULL DROP TABLE dbo.DiscoveryConfig;
+CREATE TABLE dbo.DiscoveryConfig(DBName SYSNAME PRIMARY KEY,Ord INT NOT NULL,IsActive BIT DEFAULT 1,IsTemplate BIT DEFAULT 0,IsHO BIT DEFAULT 0,BackupFilePath NVARCHAR(512) NULL,Description NVARCHAR(256) NULL,DatabaseRole NVARCHAR(10) NOT NULL,RekeyBase BIGINT NOT NULL DEFAULT 0);
+INSERT dbo.DiscoveryConfig(DBName,Ord,IsTemplate,Description,DatabaseRole,IsHO,RekeyBase)VALUES('dbZyboME',0,1,'Template','Template',0,0),('dbCompassHO',1,0,'Head Office','HO',1,0),('dbBahrain',5,0,'Bahrain','Region',0,100000000),('dbQatar',6,0,'Qatar','Region',0,200000000),('dbKuwait',7,0,'Kuwait','Region',0,300000000),('dbOman',14,0,'Oman','Region',0,400000000);
+GO
+
+-- ═══ DROP ALL DISCOVERY OBJECTS ═══
+IF OBJECT_ID('dbo.vwSingleColumnPKs','V') IS NOT NULL DROP VIEW dbo.vwSingleColumnPKs;
+IF OBJECT_ID('dbo.vwDiscoveryCandidateColumns','V') IS NOT NULL DROP VIEW dbo.vwDiscoveryCandidateColumns;
+IF OBJECT_ID('dbo.DiscoveryErrorLog','U') IS NOT NULL DROP TABLE dbo.DiscoveryErrorLog;
+IF OBJECT_ID('dbo.TableDetails','U') IS NOT NULL DROP TABLE dbo.TableDetails;
+IF OBJECT_ID('dbo.TablePKColumns','U') IS NOT NULL DROP TABLE dbo.TablePKColumns;
+IF OBJECT_ID('dbo.TableColumns','U') IS NOT NULL DROP TABLE dbo.TableColumns;
+IF OBJECT_ID('dbo.TableFKDetails','U') IS NOT NULL DROP TABLE dbo.TableFKDetails;
+IF OBJECT_ID('dbo.TableStatistics','U') IS NOT NULL DROP TABLE dbo.TableStatistics;
+IF OBJECT_ID('dbo.TableSamples','U') IS NOT NULL DROP TABLE dbo.TableSamples;
+IF OBJECT_ID('dbo.TableIndexes','U') IS NOT NULL DROP TABLE dbo.TableIndexes;
+IF OBJECT_ID('dbo.DiscoverySummary','U') IS NOT NULL DROP TABLE dbo.DiscoverySummary;
+IF OBJECT_ID('dbo.SourceCoverageReport','U') IS NOT NULL DROP TABLE dbo.SourceCoverageReport;
+IF OBJECT_ID('dbo.SourceCoverageMissingTables','U') IS NOT NULL DROP TABLE dbo.SourceCoverageMissingTables;
+IF OBJECT_ID('dbo.SchemaDriftMatrix','U') IS NOT NULL DROP TABLE dbo.SchemaDriftMatrix;
+IF OBJECT_ID('dbo.DiscoveryParameters','U') IS NOT NULL DROP TABLE dbo.DiscoveryParameters;
+IF OBJECT_ID('dbo.VirtualFKExcludedColumns','U') IS NOT NULL DROP TABLE dbo.VirtualFKExcludedColumns;
+IF OBJECT_ID('dbo.DiscoveryDataTypeFamily','U') IS NOT NULL DROP TABLE dbo.DiscoveryDataTypeFamily;
+IF OBJECT_ID('dbo.DiscoveryCandidateColumns','U') IS NOT NULL DROP TABLE dbo.DiscoveryCandidateColumns;
+IF OBJECT_ID('dbo.ObjectDiscoveryState','U') IS NOT NULL DROP TABLE dbo.ObjectDiscoveryState;
+IF OBJECT_ID('dbo.ObjectReferenceEvidence','U') IS NOT NULL DROP TABLE dbo.ObjectReferenceEvidence;
+IF OBJECT_ID('dbo.ObjectReferenceSummary','U') IS NOT NULL DROP TABLE dbo.ObjectReferenceSummary;
+IF OBJECT_ID('dbo.ColumnRelationshipEvidence','U') IS NOT NULL DROP TABLE dbo.ColumnRelationshipEvidence;
+IF OBJECT_ID('dbo.TablePresence','U') IS NOT NULL DROP TABLE dbo.TablePresence;
+GO
+
+-- ═══ CREATE ALL DISCOVERY TABLES ═══
+CREATE TABLE dbo.DiscoveryErrorLog(ErrorId INT IDENTITY PRIMARY KEY,Phase NVARCHAR(20),DatabaseName SYSNAME NULL,SchemaName SYSNAME NULL,TableName SYSNAME NULL,ErrorMessage NVARCHAR(MAX),ErrorTime DATETIME2 DEFAULT SYSUTCDATETIME());
+CREATE TABLE dbo.DiscoveryParameters(ParamName NVARCHAR(128) PRIMARY KEY,ParamValue NVARCHAR(256) NOT NULL,Description NVARCHAR(512) NULL);
+CREATE TABLE dbo.VirtualFKExcludedColumns(ColumnName SYSNAME PRIMARY KEY);
+CREATE TABLE dbo.DiscoveryDataTypeFamily(DataType NVARCHAR(128) PRIMARY KEY,FamilyCode NCHAR(1) NOT NULL,FamilyName NVARCHAR(32) NOT NULL);
+CREATE TABLE dbo.DiscoveryCandidateColumns(DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ColumnName SYSNAME NOT NULL,Source NVARCHAR(32) NOT NULL,CreatedDate DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT PK_DCC PRIMARY KEY(DatabaseName,SchemaName,TableName,ColumnName));
+CREATE TABLE dbo.TableDetails(DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ObjectId INT NULL,[RowCount] BIGINT NULL,HasData BIT DEFAULT 0,PKDataType NVARCHAR(128) NULL,CompositePK BIT NULL,HasIdentity BIT NULL,IdentityColumn NVARCHAR(256) NULL,IsGuidPK BIT NULL,HasBranchId BIT NULL,BranchIdColumn NVARCHAR(256) NULL,HasRowVersion BIT NULL,RowVersionColumn NVARCHAR(256) NULL,CONSTRAINT PK_TableDetails PRIMARY KEY(DatabaseName,SchemaName,TableName));
+CREATE TABLE dbo.TablePKColumns(DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ColumnName SYSNAME NOT NULL,Ordinal INT NOT NULL,DataType NVARCHAR(128) NOT NULL,IsDescending BIT NOT NULL,CONSTRAINT PK_TablePKColumns PRIMARY KEY(DatabaseName,SchemaName,TableName,ColumnName));
+CREATE INDEX IX_TablePKColumns_Table ON dbo.TablePKColumns(DatabaseName,SchemaName,TableName,Ordinal);
+CREATE TABLE dbo.TableColumns(DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ColumnName SYSNAME NOT NULL,DataType NVARCHAR(128) NOT NULL,MaxLength INT NULL,Precision INT NULL,Scale INT NULL,IsNullable BIT NULL,IsIdentity BIT NULL,IdentitySeed BIGINT NULL,IdentityIncrement BIGINT NULL,DefaultConstraintName NVARCHAR(256) NULL,DefaultDefinition NVARCHAR(MAX) NULL,IsComputed BIT NULL,ComputedDefinition NVARCHAR(MAX) NULL,IsPersisted BIT NULL,IsSparse BIT NULL,IsRowGuidCol BIT NULL,IsRowVersion BIT NULL,CollationName NVARCHAR(128) NULL,OrdinalPosition INT NULL,ReferenceOwner NVARCHAR(20) NULL,CONSTRAINT PK_TableColumns PRIMARY KEY(DatabaseName,SchemaName,TableName,ColumnName));
+CREATE TABLE dbo.TableFKDetails(DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,FKName SYSNAME NOT NULL,FKColumns NVARCHAR(1024) NULL,ReferencedSchema SYSNAME NULL,ReferencedTable SYSNAME NULL,ReferencedColumns NVARCHAR(1024) NULL,CompositeFK BIT NULL,DeleteAction NVARCHAR(64) NULL,UpdateAction NVARCHAR(64) NULL,IsSelfReference BIT DEFAULT 0,CONSTRAINT PK_TableFKDetails PRIMARY KEY(DatabaseName,SchemaName,TableName,FKName));
+CREATE TABLE dbo.TableStatistics(DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,[RowCount] BIGINT NULL,MinPK BIGINT NULL,MaxPK BIGINT NULL,DistinctPKCount BIGINT NULL,NullPKCount BIGINT NULL,IdentitySeed BIGINT NULL,IdentityIncrement BIGINT NULL,MinCreatedDate DATETIME2 NULL,MaxCreatedDate DATETIME2 NULL,CreatedDateColumn NVARCHAR(256) NULL,HasPrimaryKey BIT DEFAULT 0,PKDataType NVARCHAR(128) NULL,CompositePK BIT NULL,HasBranchId BIT NULL,IsGuidPK BIT NULL,CONSTRAINT PK_TableStatistics PRIMARY KEY(DatabaseName,SchemaName,TableName));
+CREATE TABLE dbo.TableSamples(DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,SampleJSON NVARCHAR(MAX) NULL,[RowCount] BIGINT NULL,SampledAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT PK_TableSamples PRIMARY KEY(DatabaseName,SchemaName,TableName));
+CREATE TABLE dbo.TableIndexes(DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,IndexName SYSNAME NOT NULL,IsUnique BIT NULL,IsPrimaryKey BIT NULL,KeyColumns NVARCHAR(MAX) NULL,CONSTRAINT PK_TableIndexes PRIMARY KEY(DatabaseName,SchemaName,TableName,IndexName));
+CREATE TABLE dbo.DiscoverySummary(DatabaseName SYSNAME PRIMARY KEY,TotalTables INT NULL,TotalFKs INT NULL,TotalIndexes INT NULL,TotalPKColumns INT NULL,TablesWithBranchId INT NULL,TablesWithCompositePK INT NULL,TablesWithIdentity INT NULL,TablesWithRowVersion INT NULL,TablesWithGuidPK INT NULL,TablesWithoutPrimaryKey INT NULL,TablesWithData INT NULL,MissingSamplesForTablesWithData INT NULL,TotalRows BIGINT NULL);
+CREATE TABLE dbo.SourceCoverageReport(DatabaseName SYSNAME PRIMARY KEY,TemplateTableCount INT NOT NULL,MatchedTableCount INT NOT NULL,MissingTableCount INT NOT NULL,CoveragePct DECIMAL(5,2) NOT NULL);
+CREATE TABLE dbo.SourceCoverageMissingTables(DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,CONSTRAINT PK_SCM PRIMARY KEY(DatabaseName,SchemaName,TableName));
+CREATE TABLE dbo.SchemaDriftMatrix(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ColumnName SYSNAME NOT NULL,DriftType NVARCHAR(64) NOT NULL,DriftSeverity NVARCHAR(16) NOT NULL,CONSTRAINT PK_SchemaDriftMatrix PRIMARY KEY(SchemaName,TableName,ColumnName));
+CREATE TABLE dbo.ObjectDiscoveryState(DatabaseName SYSNAME NOT NULL,ObjectName SYSNAME NOT NULL,ObjectType NVARCHAR(60) NOT NULL,ObjectHash VARBINARY(64) NOT NULL,LastParsed DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),ReferenceCount INT NOT NULL DEFAULT 0,CONSTRAINT PK_ObjDiscState PRIMARY KEY(DatabaseName,ObjectName,ObjectType));
+CREATE TABLE dbo.ObjectReferenceEvidence(EvidenceId INT IDENTITY PRIMARY KEY,DatabaseName SYSNAME NOT NULL,ObjectName SYSNAME NOT NULL,ObjectType NVARCHAR(60) NOT NULL,ReferencedSchema SYSNAME NOT NULL,ReferencedTable SYSNAME NOT NULL,ReferencedColumn SYSNAME NOT NULL,ReferenceCount INT NOT NULL DEFAULT 1,JoinCount INT NOT NULL DEFAULT 0,InsertCount INT NOT NULL DEFAULT 0,UpdateCount INT NOT NULL DEFAULT 0,DeleteCount INT NOT NULL DEFAULT 0,UsingJoins BIT NOT NULL DEFAULT 0,ClauseContext AS(CASE WHEN JoinCount>0 THEN 1 ELSE 0 END+CASE WHEN UpdateCount>0 THEN 2 ELSE 0 END+CASE WHEN DeleteCount>0 THEN 4 ELSE 0 END)PERSISTED,CONSTRAINT UQ_ORE UNIQUE(DatabaseName,ObjectName,ObjectType,ReferencedSchema,ReferencedTable,ReferencedColumn));
+CREATE TABLE dbo.ObjectReferenceSummary(SummaryId INT IDENTITY PRIMARY KEY,DatabaseName SYSNAME NOT NULL,ReferencedSchema SYSNAME NOT NULL,ReferencedTable SYSNAME NOT NULL,ReferencedColumn SYSNAME NOT NULL,ViewCount INT NOT NULL DEFAULT 0,ProcedureCount INT NOT NULL DEFAULT 0,FunctionCount INT NOT NULL DEFAULT 0,TriggerCount INT NOT NULL DEFAULT 0,TotalObjectCount INT NOT NULL DEFAULT 0,TotalJoinRef INT NOT NULL DEFAULT 0,TotalInsertRef INT NOT NULL DEFAULT 0,TotalUpdateRef INT NOT NULL DEFAULT 0,TotalDeleteRef INT NOT NULL DEFAULT 0,TotalUsingJoins INT NOT NULL DEFAULT 0,ClauseContextMask INT NOT NULL DEFAULT 0,CONSTRAINT UQ_ObjRefSummary UNIQUE(DatabaseName,ReferencedSchema,ReferencedTable,ReferencedColumn));
+CREATE TABLE dbo.ColumnRelationshipEvidence(EvidenceId INT IDENTITY PRIMARY KEY,DatabaseName SYSNAME NOT NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,FKColumn SYSNAME NOT NULL,ReferencedSchema SYSNAME NOT NULL,ReferencedTable SYSNAME NOT NULL,ReferencedColumn SYSNAME NOT NULL,SameName BIT NOT NULL DEFAULT 0,SameDatatype BIT NOT NULL DEFAULT 0,SameDatatypeFamily BIT NOT NULL DEFAULT 0,CompositeName BIT NOT NULL DEFAULT 0,SupportingIndexCount SMALLINT NOT NULL DEFAULT 0,ReferencedByUniqueConstraint BIT NOT NULL DEFAULT 0,ObjectReferenceCount INT NOT NULL DEFAULT 0,ChildNonNullRows BIGINT NULL,DistinctChildKeys BIGINT NULL,OrphanRows BIGINT NULL,MatchCoveragePct DECIMAL(9,4) NULL,CONSTRAINT UQ_CRE UNIQUE(DatabaseName,SchemaName,TableName,FKColumn,ReferencedSchema,ReferencedTable,ReferencedColumn));
+GO
+
+-- ═══ VIEWS ═══
+CREATE VIEW dbo.vwSingleColumnPKs AS
+SELECT pk.DatabaseName,pk.SchemaName,pk.TableName,pk.ColumnName,pk.DataType,dtf.FamilyCode
+FROM dbo.TablePKColumns pk JOIN dbo.DiscoveryDataTypeFamily dtf ON dtf.DataType=pk.DataType
+WHERE NOT EXISTS(SELECT 1 FROM dbo.TablePKColumns pk2 WHERE pk2.DatabaseName=pk.DatabaseName AND pk2.SchemaName=pk.SchemaName AND pk2.TableName=pk.TableName AND pk2.Ordinal=2);
+GO
+CREATE VIEW dbo.vwDiscoveryCandidateColumns AS
+SELECT DatabaseName,SchemaName,TableName,ColumnName FROM dbo.DiscoveryCandidateColumns GROUP BY DatabaseName,SchemaName,TableName,ColumnName;
+GO
+
+-- ═══ CONFIGURATION DATA ═══
+INSERT dbo.DiscoveryParameters(ParamName,ParamValue,Description) VALUES
+(N'VirtualFK_MaxColumnFrequency',N'50',N'Max tables a column name can appear in'),
+(N'VirtualFK_MinColumnNameLength',N'4',N'Min column name length'),
+(N'VirtualFK_MinSuffixTableCount',N'3',N'Min tables for PK column to qualify as generic suffix'),
+(N'VirtualFK_MinRows',N'10',N'Stored as fact for Layer 2'),(N'VirtualFK_MinCoveragePct',N'90',N'Filter by MatchCoveragePct >= threshold as fact for Layer 2'),
+(N'VirtualFK_MinDistinct',N'2',N'Stored as fact for Layer 2'),
+(N'VirtualFK_MaxOrphanPct',N'10',N'Stored as fact for Layer 2'),
+(N'VirtualFK_EnableSQLObjectEvidence',N'1',N'Enable incremental SQL object parsing'),
+(N'VirtualFK_EnableEvidenceFilter',N'0',N'Filter low-evidence candidates before validation (0=disabled, 1=enabled)'),
+(N'VirtualFK_MinEvidence',N'25',N'Min evidence score for validation (only used when filter enabled)');
+INSERT dbo.VirtualFKExcludedColumns(ColumnName) VALUES(N'ID'),(N'CODE'),(N'TYPE'),(N'VALUE'),(N'STATUS'),(N'NAME'),(N'CREATEDBY'),(N'UPDATEDBY'),(N'MODIFIEDBY'),(N'DELETEDBY'),(N'CREATEDDATE'),(N'UPDATEDDATE'),(N'MODIFIEDDATE'),(N'DELETEDDATE'),(N'ISACTIVE'),(N'ISDELETED'),(N'ISENABLED'),(N'ISPROCESSED'),(N'DESCRIPTION'),(N'ROWGUID'),(N'ROWVERSION');
+INSERT dbo.DiscoveryDataTypeFamily(DataType,FamilyCode,FamilyName) VALUES(N'bigint',N'I',N'Integer'),(N'int',N'I',N'Integer'),(N'smallint',N'I',N'Integer'),(N'tinyint',N'I',N'Integer'),(N'bit',N'I',N'Integer'),(N'decimal',N'N',N'Numeric'),(N'numeric',N'N',N'Numeric'),(N'float',N'N',N'Numeric'),(N'real',N'N',N'Numeric'),(N'money',N'N',N'Numeric'),(N'smallmoney',N'N',N'Numeric'),(N'varchar',N'S',N'String'),(N'nvarchar',N'S',N'String'),(N'char',N'S',N'String'),(N'nchar',N'S',N'String'),(N'text',N'S',N'String'),(N'ntext',N'S',N'String'),(N'sysname',N'S',N'String'),(N'datetime',N'D',N'Date'),(N'datetime2',N'D',N'Date'),(N'smalldatetime',N'D',N'Date'),(N'date',N'D',N'Date'),(N'time',N'D',N'Date'),(N'datetimeoffset',N'D',N'Date'),(N'uniqueidentifier',N'G',N'Guid'),(N'binary',N'B',N'Binary'),(N'varbinary',N'B',N'Binary'),(N'image',N'B',N'Binary');
+GO
+
+-- ═══ PHASE 1: TABLES ═══
+PRINT N'[PHASE 1] Discovering tables...';
+DECLARE @DB SYSNAME,@SQL NVARCHAR(MAX);
+DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 ORDER BY Ord;
+OPEN db_cur; FETCH NEXT FROM db_cur INTO @DB;
+WHILE @@FETCH_STATUS=0 BEGIN
+SET @SQL=N'INSERT dbo.TableDetails(DatabaseName,SchemaName,TableName,ObjectId,[RowCount],HasData,PKDataType,CompositePK,HasIdentity,IdentityColumn,IsGuidPK,HasBranchId,BranchIdColumn,HasRowVersion,RowVersionColumn) SELECT N'''+REPLACE(@DB,'''','''''')+N''',s.name,t.name,t.object_id,ISNULL(p.rows,0),CASE WHEN ISNULL(p.rows,0)>0 THEN 1 ELSE 0 END,(SELECT TOP 1 tp.name FROM '+QUOTENAME(@DB)+N'.sys.index_columns ic JOIN '+QUOTENAME(@DB)+N'.sys.columns c ON ic.object_id=c.object_id AND ic.column_id=c.column_id JOIN '+QUOTENAME(@DB)+N'.sys.types tp ON c.user_type_id=tp.user_type_id WHERE ic.object_id=i.object_id AND ic.index_id=i.index_id AND ic.is_included_column=0 ORDER BY ic.key_ordinal),CASE WHEN(SELECT COUNT(*)FROM '+QUOTENAME(@DB)+N'.sys.index_columns ic WHERE ic.object_id=i.object_id AND ic.index_id=i.index_id AND ic.is_included_column=0)>1 THEN 1 ELSE 0 END,CASE WHEN EXISTS(SELECT 1 FROM '+QUOTENAME(@DB)+N'.sys.identity_columns ic WHERE ic.object_id=t.object_id)THEN 1 ELSE 0 END,(SELECT TOP 1 ic.name FROM '+QUOTENAME(@DB)+N'.sys.identity_columns ic WHERE ic.object_id=t.object_id),CASE WHEN EXISTS(SELECT 1 FROM '+QUOTENAME(@DB)+N'.sys.index_columns ic JOIN '+QUOTENAME(@DB)+N'.sys.columns c ON ic.object_id=c.object_id AND ic.column_id=c.column_id JOIN '+QUOTENAME(@DB)+N'.sys.types tp ON c.user_type_id=tp.user_type_id WHERE ic.object_id=i.object_id AND ic.index_id=i.index_id AND ic.is_included_column=0 AND ic.key_ordinal=1 AND tp.name=''uniqueidentifier'')THEN 1 ELSE 0 END,CASE WHEN EXISTS(SELECT 1 FROM '+QUOTENAME(@DB)+N'.sys.columns c WHERE c.object_id=t.object_id AND REPLACE(LOWER(c.name),''_'','''')=''branchid'')THEN 1 ELSE 0 END,(SELECT TOP 1 c.name FROM '+QUOTENAME(@DB)+N'.sys.columns c WHERE c.object_id=t.object_id AND REPLACE(LOWER(c.name),''_'','''')=''branchid''),CASE WHEN EXISTS(SELECT 1 FROM '+QUOTENAME(@DB)+N'.sys.columns c WHERE c.object_id=t.object_id AND c.system_type_id=189)THEN 1 ELSE 0 END,(SELECT TOP 1 c.name FROM '+QUOTENAME(@DB)+N'.sys.columns c WHERE c.object_id=t.object_id AND c.system_type_id=189) FROM '+QUOTENAME(@DB)+N'.sys.tables t JOIN '+QUOTENAME(@DB)+N'.sys.schemas s ON t.schema_id=s.schema_id LEFT JOIN '+QUOTENAME(@DB)+N'.sys.indexes i ON t.object_id=i.object_id AND i.is_primary_key=1 LEFT JOIN '+QUOTENAME(@DB)+N'.sys.partitions p ON t.object_id=p.object_id AND p.index_id IN(0,1) WHERE t.is_ms_shipped=0;';
+BEGIN TRY EXEC sp_executesql @SQL; PRINT N'  [PHASE 1] '+@DB+N' OK'; END TRY BEGIN CATCH INSERT dbo.DiscoveryErrorLog(Phase,DatabaseName,ErrorMessage)VALUES(N'PHASE 1',@DB,ERROR_MESSAGE()); END CATCH;
+FETCH NEXT FROM db_cur INTO @DB; END CLOSE db_cur; DEALLOCATE db_cur;
+DECLARE @Msg NVARCHAR(MAX) = CAST((SELECT COUNT(*)FROM dbo.TableDetails)AS NVARCHAR(20));
+PRINT N'[PHASE 1] Tables: '+@Msg;
+GO
+
+-- ═══ PHASE 1B: PK COLUMNS ═══
+PRINT N'[PHASE 1B] PK Columns...';
+DECLARE @DB SYSNAME,@SQL NVARCHAR(MAX);
+DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 ORDER BY Ord;
+OPEN db_cur; FETCH NEXT FROM db_cur INTO @DB;
+WHILE @@FETCH_STATUS=0 BEGIN
+SET @SQL=N'INSERT dbo.TablePKColumns(DatabaseName,SchemaName,TableName,ColumnName,Ordinal,DataType,IsDescending) SELECT N'''+REPLACE(@DB,'''','''''')+N''',s.name,t.name,c.name,ic.key_ordinal,tp.name,ic.is_descending_key FROM '+QUOTENAME(@DB)+N'.sys.indexes i JOIN '+QUOTENAME(@DB)+N'.sys.index_columns ic ON i.object_id=ic.object_id AND i.index_id=ic.index_id JOIN '+QUOTENAME(@DB)+N'.sys.columns c ON ic.object_id=c.object_id AND ic.column_id=c.column_id JOIN '+QUOTENAME(@DB)+N'.sys.types tp ON c.user_type_id=tp.user_type_id JOIN '+QUOTENAME(@DB)+N'.sys.tables t ON i.object_id=t.object_id JOIN '+QUOTENAME(@DB)+N'.sys.schemas s ON t.schema_id=s.schema_id WHERE i.is_primary_key=1 AND ic.is_included_column=0 AND t.is_ms_shipped=0;';
+BEGIN TRY EXEC sp_executesql @SQL; PRINT N'  [PHASE 1B] '+@DB+N' OK'; END TRY BEGIN CATCH INSERT dbo.DiscoveryErrorLog(Phase,DatabaseName,ErrorMessage)VALUES(N'PHASE 1B',@DB,ERROR_MESSAGE()); END CATCH;
+FETCH NEXT FROM db_cur INTO @DB; END CLOSE db_cur; DEALLOCATE db_cur;
+DECLARE @Msg NVARCHAR(MAX) = CAST((SELECT COUNT(*)FROM dbo.TablePKColumns)AS NVARCHAR(20));
+PRINT N'[PHASE 1B] PK Columns: '+@Msg;
+GO
+
+-- ═══ PHASE 1C: COLUMNS ═══
+PRINT N'[PHASE 1C] Columns...';
+DECLARE @DB SYSNAME,@SQL NVARCHAR(MAX);
+DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 ORDER BY Ord;
+OPEN db_cur; FETCH NEXT FROM db_cur INTO @DB;
+WHILE @@FETCH_STATUS=0 BEGIN
+SET @SQL=N'INSERT dbo.TableColumns(DatabaseName,SchemaName,TableName,ColumnName,DataType,MaxLength,Precision,Scale,IsNullable,IsIdentity,IdentitySeed,IdentityIncrement,DefaultConstraintName,DefaultDefinition,IsComputed,ComputedDefinition,IsPersisted,IsSparse,IsRowGuidCol,IsRowVersion,CollationName,OrdinalPosition) SELECT N'''+REPLACE(@DB,'''','''''')+N''',s.name,t.name,c.name,tp.name,c.max_length,c.precision,c.scale,c.is_nullable,c.is_identity,CAST(ic.seed_value AS BIGINT),CAST(ic.increment_value AS BIGINT),dc.name,dc.definition,c.is_computed,cc.definition,cc.is_persisted,c.is_sparse,c.is_rowguidcol,CASE WHEN c.system_type_id=189 THEN 1 ELSE 0 END,c.collation_name,c.column_id FROM '+QUOTENAME(@DB)+N'.sys.tables t JOIN '+QUOTENAME(@DB)+N'.sys.schemas s ON t.schema_id=s.schema_id JOIN '+QUOTENAME(@DB)+N'.sys.columns c ON t.object_id=c.object_id JOIN '+QUOTENAME(@DB)+N'.sys.types tp ON c.user_type_id=tp.user_type_id LEFT JOIN '+QUOTENAME(@DB)+N'.sys.identity_columns ic ON ic.object_id=c.object_id AND ic.column_id=c.column_id LEFT JOIN '+QUOTENAME(@DB)+N'.sys.default_constraints dc ON dc.parent_object_id=c.object_id AND dc.parent_column_id=c.column_id LEFT JOIN '+QUOTENAME(@DB)+N'.sys.computed_columns cc ON cc.object_id=c.object_id AND cc.column_id=c.column_id WHERE t.is_ms_shipped=0;';
+BEGIN TRY EXEC sp_executesql @SQL; PRINT N'  [PHASE 1C] '+@DB+N' OK'; END TRY BEGIN CATCH INSERT dbo.DiscoveryErrorLog(Phase,DatabaseName,ErrorMessage)VALUES(N'PHASE 1C',@DB,ERROR_MESSAGE()); END CATCH;
+FETCH NEXT FROM db_cur INTO @DB; END CLOSE db_cur; DEALLOCATE db_cur;
+UPDATE dbo.TableColumns SET ReferenceOwner=N'HO' WHERE ReferenceOwner IS NULL AND(LTRIM(RTRIM(UPPER(ColumnName)))LIKE N'HO%ID' OR LTRIM(RTRIM(UPPER(ColumnName)))LIKE N'HO%CODE' OR LTRIM(RTRIM(UPPER(ColumnName)))LIKE N'HO%NO' OR LTRIM(RTRIM(UPPER(ColumnName)))IN(N'HOEMPID',N'HOREPORTTOID',N'AHOEMPID',N'HOCOMPANYID',N'HOCUSTOMERID',N'HOVENDORID',N'HOSALESPERSONID'));
+DECLARE @Msg NVARCHAR(MAX) = CAST((SELECT COUNT(*)FROM dbo.TableColumns)AS NVARCHAR(20));
+PRINT N'[PHASE 1C] Columns: '+@Msg;
+GO
+
+-- ═══ PHASE 2: DECLARED FKs ═══
+PRINT N'[PHASE 2] Foreign Keys...';
+DECLARE @DB SYSNAME,@SQL NVARCHAR(MAX);
+DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 ORDER BY Ord;
+OPEN db_cur; FETCH NEXT FROM db_cur INTO @DB;
+WHILE @@FETCH_STATUS=0 BEGIN
+SET @SQL=N'INSERT dbo.TableFKDetails(DatabaseName,SchemaName,TableName,FKName,FKColumns,ReferencedSchema,ReferencedTable,ReferencedColumns,CompositeFK,DeleteAction,UpdateAction,IsSelfReference) SELECT N'''+REPLACE(@DB,'''','''''')+N''',s.name,t.name,fk.name,STUFF((SELECT N'',''+QUOTENAME(c.name)FROM '+QUOTENAME(@DB)+N'.sys.foreign_key_columns fkc JOIN '+QUOTENAME(@DB)+N'.sys.columns c ON fkc.parent_object_id=c.object_id AND fkc.parent_column_id=c.column_id WHERE fkc.constraint_object_id=fk.object_id ORDER BY fkc.constraint_column_id FOR XML PATH(''''),TYPE).value(''.'',''nvarchar(max)''),1,1,''''),rs.name,rt.name,STUFF((SELECT N'',''+QUOTENAME(c.name)FROM '+QUOTENAME(@DB)+N'.sys.foreign_key_columns fkc JOIN '+QUOTENAME(@DB)+N'.sys.columns c ON fkc.referenced_object_id=c.object_id AND fkc.referenced_column_id=c.column_id WHERE fkc.constraint_object_id=fk.object_id ORDER BY fkc.constraint_column_id FOR XML PATH(''''),TYPE).value(''.'',''nvarchar(max)''),1,1,''''),CASE WHEN(SELECT COUNT(*)FROM '+QUOTENAME(@DB)+N'.sys.foreign_key_columns fkc WHERE fkc.constraint_object_id=fk.object_id)>1 THEN 1 ELSE 0 END,fk.delete_referential_action_desc,fk.update_referential_action_desc,CASE WHEN t.object_id=rt.object_id THEN 1 ELSE 0 END FROM '+QUOTENAME(@DB)+N'.sys.foreign_keys fk JOIN '+QUOTENAME(@DB)+N'.sys.tables t ON fk.parent_object_id=t.object_id JOIN '+QUOTENAME(@DB)+N'.sys.schemas s ON t.schema_id=s.schema_id JOIN '+QUOTENAME(@DB)+N'.sys.tables rt ON fk.referenced_object_id=rt.object_id JOIN '+QUOTENAME(@DB)+N'.sys.schemas rs ON rt.schema_id=rs.schema_id;';
+BEGIN TRY EXEC sp_executesql @SQL; PRINT N'  [PHASE 2] '+@DB+N' OK'; END TRY BEGIN CATCH INSERT dbo.DiscoveryErrorLog(Phase,DatabaseName,ErrorMessage)VALUES(N'PHASE 2',@DB,ERROR_MESSAGE()); END CATCH;
+FETCH NEXT FROM db_cur INTO @DB; END CLOSE db_cur; DEALLOCATE db_cur;
+DECLARE @Msg NVARCHAR(MAX) = CAST((SELECT COUNT(*)FROM dbo.TableFKDetails)AS NVARCHAR(20));
+PRINT N'[PHASE 2] Declared FKs: '+@Msg;
+GO
+
+-- ═══ PHASE 2A: SQL OBJECT REFERENCE DISCOVERY ═══
+-- Tier 1: sys.sql_expression_dependencies (primary, column-level via referenced_minor_id)
+-- Tier 2: Clause context for Tier 1 references (cheap CHARINDEX on known pairs)
+-- Tier 3: Text parser for zero-dependency objects with JOIN (fallback, uses DiscoveryCandidateColumns)
+-- Hash uses fn_NormalizeForHash; search uses fn_NormalizeForSearch (schema-stripped)
+-- Alias detection only runs when object contains " AS " (skips ~70% of objects)
+-- All tiers produce facts only. No intelligence.
+PRINT N'[PHASE 2A] SQL Object Reference Discovery...';
+DECLARE @EnableSQL BIT=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_EnableSQLObjectEvidence'),N'1')AS BIT);
+IF @EnableSQL=1
+BEGIN
+    DECLARE @DB SYSNAME,@SQL NVARCHAR(MAX);
+    DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 ORDER BY Ord;
+    OPEN db_cur; FETCH NEXT FROM db_cur INTO @DB;
+    WHILE @@FETCH_STATUS=0
+    BEGIN
+        SET @SQL=N'
+DECLARE @L NVARCHAR(128)=N'''+REPLACE(@DB,'''','''''')+N''';
+
+IF OBJECT_ID(''tempdb..#OC'')IS NOT NULL DROP TABLE #OC;
+SELECT o.object_id,o.name AS ObjName,o.type_desc AS ObjType,HASHBYTES(''SHA2_256'',MasterMerge.dbo.fn_NormalizeForHash(m.definition)) AS ObjHash
+INTO #OC
+FROM '+QUOTENAME(@DB)+N'.sys.sql_modules m
+JOIN '+QUOTENAME(@DB)+N'.sys.objects o ON m.object_id=o.object_id
+WHERE o.type IN(''V'',''P'',''FN'',''TF'',''IF'',''TR'') AND m.definition IS NOT NULL;
+
+IF OBJECT_ID(''tempdb..#OChg'')IS NOT NULL DROP TABLE #OChg;
+SELECT oc.ObjName,oc.ObjType,oc.ObjHash,MasterMerge.dbo.fn_NormalizeForSearch(m.definition) AS NormDef
+INTO #OChg
+FROM #OC oc
+JOIN '+QUOTENAME(@DB)+N'.sys.sql_modules m ON m.object_id=oc.object_id
+LEFT JOIN dbo.ObjectDiscoveryState ods ON ods.DatabaseName=@L AND ods.ObjectName=oc.ObjName COLLATE DATABASE_DEFAULT AND ods.ObjectType=oc.ObjType COLLATE DATABASE_DEFAULT
+WHERE ods.ObjectHash IS NULL OR ods.ObjectHash<>oc.ObjHash;
+
+DELETE ore FROM dbo.ObjectReferenceEvidence ore WHERE ore.DatabaseName=@L AND EXISTS(SELECT 1 FROM #OChg c WHERE c.ObjName COLLATE DATABASE_DEFAULT=ore.ObjectName AND c.ObjType COLLATE DATABASE_DEFAULT=ore.ObjectType);
+
+IF NOT EXISTS(SELECT 1 FROM #OChg) GOTO SkipParse;
+
+-- TIER 1: sys.sql_expression_dependencies
+IF OBJECT_ID(''tempdb..#Dep'')IS NOT NULL DROP TABLE #Dep;
+SELECT o.name AS ObjName,o.type_desc AS ObjType,rs.name AS RefSchema,rt.name AS RefTable,ISNULL(rc.name,'''') AS RefColumn,sed.referenced_minor_id AS RefMinorId
+INTO #Dep
+FROM '+QUOTENAME(@DB)+N'.sys.sql_expression_dependencies sed
+JOIN '+QUOTENAME(@DB)+N'.sys.objects o ON sed.referencing_id=o.object_id
+JOIN '+QUOTENAME(@DB)+N'.sys.tables rt ON sed.referenced_id=rt.object_id
+JOIN '+QUOTENAME(@DB)+N'.sys.schemas rs ON rt.schema_id=rs.schema_id
+LEFT JOIN '+QUOTENAME(@DB)+N'.sys.columns rc ON rc.object_id=sed.referenced_id AND rc.column_id=sed.referenced_minor_id AND sed.referenced_minor_id>0
+WHERE o.type IN(''V'',''P'',''FN'',''TF'',''IF'',''TR'') AND sed.referenced_id IS NOT NULL AND rs.name IS NOT NULL
+AND EXISTS(SELECT 1 FROM #OChg c WHERE c.ObjName=o.name AND c.ObjType=o.type_desc);
+CREATE INDEX IX_Dep ON #Dep(ObjName,ObjType,RefSchema,RefTable,RefColumn);
+
+IF OBJECT_ID(''tempdb..#NoDep'')IS NOT NULL DROP TABLE #NoDep;
+SELECT c.ObjName,c.ObjType,c.NormDef INTO #NoDep FROM #OChg c WHERE NOT EXISTS(SELECT 1 FROM #Dep d WHERE d.ObjName=c.ObjName AND d.ObjType=c.ObjType);
+
+-- TIER 2: Clause context for Tier 1 references
+IF OBJECT_ID(''tempdb..#Clause'')IS NOT NULL DROP TABLE #Clause;
+SELECT d.ObjName,d.ObjType,d.RefSchema,d.RefTable,
+    MAX(CASE WHEN CHARINDEX(N''JOIN ''+UPPER(d.RefTable),c.NormDef)>0 THEN 1 ELSE 0 END) AS JoinCnt,
+    MAX(CASE WHEN CHARINDEX(N''INTO ''+UPPER(d.RefTable),c.NormDef)>0 THEN 1 ELSE 0 END) AS InsertCnt,
+    MAX(CASE WHEN CHARINDEX(N''UPDATE ''+UPPER(d.RefTable),c.NormDef)>0 THEN 1 ELSE 0 END) AS UpdateCnt,
+    MAX(CASE WHEN CHARINDEX(N''DELETE FROM ''+UPPER(d.RefTable),c.NormDef)>0 THEN 1 ELSE 0 END) AS DeleteCnt,
+    MAX(CASE WHEN CHARINDEX(N''JOIN '',c.NormDef)>0 THEN 1 ELSE 0 END) AS UsingJoins
+INTO #Clause
+FROM #Dep d JOIN #OChg c ON c.ObjName=d.ObjName AND c.ObjType=d.ObjType
+GROUP BY d.ObjName,d.ObjType,d.RefSchema,d.RefTable;
+CREATE INDEX IX_Cl ON #Clause(ObjName,ObjType,RefSchema,RefTable);
+
+INSERT dbo.ObjectReferenceEvidence(DatabaseName,ObjectName,ObjectType,ReferencedSchema,ReferencedTable,ReferencedColumn,ReferenceCount,JoinCount,InsertCount,UpdateCount,DeleteCount,UsingJoins)
+SELECT @L,d.ObjName COLLATE DATABASE_DEFAULT,d.ObjType COLLATE DATABASE_DEFAULT,d.RefSchema COLLATE DATABASE_DEFAULT,d.RefTable COLLATE DATABASE_DEFAULT,d.RefColumn COLLATE DATABASE_DEFAULT,COUNT(*),ISNULL(MAX(cl.JoinCnt),0),ISNULL(MAX(cl.InsertCnt),0),ISNULL(MAX(cl.UpdateCnt),0),ISNULL(MAX(cl.DeleteCnt),0),ISNULL(MAX(cl.UsingJoins),0)
+FROM #Dep d LEFT JOIN #Clause cl ON cl.ObjName=d.ObjName AND cl.ObjType=d.ObjType AND cl.RefSchema=d.RefSchema AND cl.RefTable=d.RefTable
+WHERE d.RefMinorId>0 GROUP BY d.ObjName,d.ObjType,d.RefSchema,d.RefTable,d.RefColumn;
+
+INSERT dbo.ObjectReferenceEvidence(DatabaseName,ObjectName,ObjectType,ReferencedSchema,ReferencedTable,ReferencedColumn,ReferenceCount,JoinCount,InsertCount,UpdateCount,DeleteCount,UsingJoins)
+SELECT @L,d.ObjName COLLATE DATABASE_DEFAULT,d.ObjType COLLATE DATABASE_DEFAULT,d.RefSchema COLLATE DATABASE_DEFAULT,d.RefTable COLLATE DATABASE_DEFAULT,N'''',1,ISNULL(MAX(cl.JoinCnt),0),ISNULL(MAX(cl.InsertCnt),0),ISNULL(MAX(cl.UpdateCnt),0),ISNULL(MAX(cl.DeleteCnt),0),ISNULL(MAX(cl.UsingJoins),0)
+FROM #Dep d LEFT JOIN #Clause cl ON cl.ObjName=d.ObjName AND cl.ObjType=d.ObjType AND cl.RefSchema=d.RefSchema AND cl.RefTable=d.RefTable
+WHERE d.RefMinorId=0 AND NOT EXISTS(SELECT 1 FROM dbo.ObjectReferenceEvidence ore WHERE ore.DatabaseName=@L AND ore.ObjectName=d.ObjName COLLATE DATABASE_DEFAULT AND ore.ObjectType=d.ObjType COLLATE DATABASE_DEFAULT AND ore.ReferencedSchema=d.RefSchema COLLATE DATABASE_DEFAULT AND ore.ReferencedTable=d.RefTable COLLATE DATABASE_DEFAULT AND ore.ReferencedColumn<>N'''')
+GROUP BY d.ObjName,d.ObjType,d.RefSchema,d.RefTable;
+
+-- TIER 3: Text parser (fallback, only zero-dep objects with JOIN, uses materialized candidate columns)
+IF EXISTS(SELECT 1 FROM #NoDep WHERE CHARINDEX(N''JOIN '',NormDef)>0)
+BEGIN
+    IF OBJECT_ID(''tempdb..#TxtChg'')IS NOT NULL DROP TABLE #TxtChg;
+    SELECT ObjName,ObjType,NormDef INTO #TxtChg FROM #NoDep WHERE CHARINDEX(N''JOIN '',NormDef)>0;
+
+    IF OBJECT_ID(''tempdb..#TxtTbl'')IS NOT NULL DROP TABLE #TxtTbl;
+    SELECT c.ObjName,c.ObjType,t.SchemaName,t.TableName,
+        MAX(CASE WHEN CHARINDEX(N''JOIN ''+UPPER(t.TableName)+N'' '',c.NormDef)>0 OR CHARINDEX(N''JOIN ''+UPPER(t.TableName)+N'' AS '',c.NormDef)>0 THEN 1 ELSE 0 END) AS JoinCnt,
+        MAX(CASE WHEN CHARINDEX(N''INTO ''+UPPER(t.TableName)+N'' '',c.NormDef)>0 THEN 1 ELSE 0 END) AS InsertCnt,
+        MAX(CASE WHEN CHARINDEX(N''UPDATE ''+UPPER(t.TableName)+N'' '',c.NormDef)>0 OR CHARINDEX(N''UPDATE ''+UPPER(t.TableName)+N'' SET'',c.NormDef)>0 THEN 1 ELSE 0 END) AS UpdateCnt,
+        MAX(CASE WHEN CHARINDEX(N''DELETE FROM ''+UPPER(t.TableName)+N'' '',c.NormDef)>0 THEN 1 ELSE 0 END) AS DeleteCnt
+    INTO #TxtTbl
+    FROM #TxtChg c CROSS JOIN(SELECT DISTINCT SchemaName,TableName FROM dbo.TableColumns WHERE DatabaseName=@L AND LEN(TableName)>=3 AND IsComputed=0)t
+    WHERE CHARINDEX(N''JOIN ''+UPPER(t.TableName)+N'' '',c.NormDef)>0 OR CHARINDEX(N''JOIN ''+UPPER(t.TableName)+N'' AS '',c.NormDef)>0 OR CHARINDEX(N''FROM ''+UPPER(t.TableName)+N'' '',c.NormDef)>0 OR CHARINDEX(N''FROM ''+UPPER(t.TableName)+N'' AS '',c.NormDef)>0 OR CHARINDEX(N''INTO ''+UPPER(t.TableName)+N'' '',c.NormDef)>0 OR CHARINDEX(N''UPDATE ''+UPPER(t.TableName)+N'' '',c.NormDef)>0 OR CHARINDEX(N''UPDATE ''+UPPER(t.TableName)+N'' SET'',c.NormDef)>0 OR CHARINDEX(N''DELETE FROM ''+UPPER(t.TableName)+N'' '',c.NormDef)>0
+    GROUP BY c.ObjName,c.ObjType,t.SchemaName,t.TableName;
+    CREATE INDEX IX_TT ON #TxtTbl(ObjName,ObjType,SchemaName,TableName);
+
+    IF OBJECT_ID(''tempdb..#Alias'')IS NOT NULL DROP TABLE #Alias;
+    SELECT ObjName,ObjType,SchemaName,TableName,Alias INTO #Alias FROM(
+        SELECT tr.ObjName,tr.ObjType,tr.SchemaName,tr.TableName,CASE WHEN PATINDEX(N''%[^A-Z0-9_]%'',SUBSTRING(c.NormDef,CHARINDEX(UPPER(tr.TableName+N'' ''),c.NormDef)+LEN(UPPER(tr.TableName))+1,8))BETWEEN 2 AND 4 THEN LTRIM(RTRIM(SUBSTRING(c.NormDef,CHARINDEX(UPPER(tr.TableName+N'' ''),c.NormDef)+LEN(UPPER(tr.TableName))+1,PATINDEX(N''%[^A-Z0-9_]%'',SUBSTRING(c.NormDef,CHARINDEX(UPPER(tr.TableName+N'' ''),c.NormDef)+LEN(UPPER(tr.TableName))+1,8))-1))) ELSE NULL END AS Alias
+        FROM #TxtTbl tr JOIN #TxtChg c ON c.ObjName=tr.ObjName AND c.ObjType=tr.ObjType
+        WHERE CHARINDEX(N'' AS '',c.NormDef)>0 AND CHARINDEX(UPPER(tr.TableName+N'' ''),c.NormDef)>0
+    )x WHERE Alias IS NOT NULL AND LEN(Alias)BETWEEN 1 AND 4 AND UPPER(Alias)NOT IN(N''SET'',N''WHERE'',N''FROM'',N''JOIN'',N''LEFT'',N''RIGHT'',N''INNER'',N''OUTER'',N''ON'',N''AND'',N''OR'',N''AS'',N''NOT'',N''NULL'',N''THEN'',N''WHEN'',N''CASE'',N''ELSE'',N''END'',N''INTO'',N''VALUES'',N''SELECT'',N''GROUP'',N''ORDER'',N''HAVING'',N''UNION'',N''CROSS'',N''WITH'',N''DELETE'',N''UPDATE'',N''INSERT'',N''MERGE'',N''TOP'',N''DISTINCT'',N''ALL'',N''OVER'',N''BY'',N''IS'',N''IN'',N''LIKE'',N''BETWEEN'',N''EXISTS'',N''ANY'',N''SOME'',N''PIVOT'',N''UNPIVOT'',N''APPLY'');
+
+    IF OBJECT_ID(''tempdb..#TxtOM'')IS NOT NULL DROP TABLE #TxtOM;
+    SELECT ObjName,ObjType,SchemaName,TableName,ColumnName,JoinCnt,InsertCnt,UpdateCnt,DeleteCnt,ColRefCount INTO #TxtOM FROM(
+        SELECT tr.ObjName,tr.ObjType,tr.SchemaName,tr.TableName,col.ColumnName,tr.JoinCnt,tr.InsertCnt,tr.UpdateCnt,tr.DeleteCnt,(LEN(c.NormDef)-LEN(REPLACE(c.NormDef,UPPER(tr.TableName+N''.''+col.ColumnName),N'''')))/NULLIF(LEN(UPPER(tr.TableName+N''.''+col.ColumnName)),0) AS ColRefCount
+        FROM #TxtTbl tr JOIN #TxtChg c ON c.ObjName=tr.ObjName AND c.ObjType=tr.ObjType JOIN dbo.DiscoveryCandidateColumns col ON col.DatabaseName=@L AND col.SchemaName=tr.SchemaName AND col.TableName=tr.TableName WHERE CHARINDEX(UPPER(tr.TableName+N''.''+col.ColumnName),c.NormDef)>0
+        UNION
+        SELECT al.ObjName,al.ObjType,al.SchemaName,al.TableName,col.ColumnName,ISNULL(tr.JoinCnt,0),ISNULL(tr.InsertCnt,0),ISNULL(tr.UpdateCnt,0),ISNULL(tr.DeleteCnt,0),(LEN(c.NormDef)-LEN(REPLACE(c.NormDef,UPPER(al.Alias+N''.''+col.ColumnName),N'''')))/NULLIF(LEN(UPPER(al.Alias+N''.''+col.ColumnName)),0) AS ColRefCount
+        FROM #Alias al JOIN #TxtChg c ON c.ObjName=al.ObjName AND c.ObjType=al.ObjType LEFT JOIN #TxtTbl tr ON tr.ObjName=al.ObjName AND tr.ObjType=al.ObjType AND tr.SchemaName=al.SchemaName AND tr.TableName=al.TableName JOIN dbo.DiscoveryCandidateColumns col ON col.DatabaseName=@L AND col.SchemaName=al.SchemaName AND col.TableName=al.TableName
+        WHERE CHARINDEX(UPPER(al.Alias+N''.''+col.ColumnName),c.NormDef)>0 AND NOT CHARINDEX(UPPER(al.TableName+N''.''+col.ColumnName),c.NormDef)>0 AND tr.ObjName IS NULL
+    )all_refs;
+
+    INSERT dbo.ObjectReferenceEvidence(DatabaseName,ObjectName,ObjectType,ReferencedSchema,ReferencedTable,ReferencedColumn,ReferenceCount,JoinCount,InsertCount,UpdateCount,DeleteCount,UsingJoins)
+    SELECT @L,ObjName COLLATE DATABASE_DEFAULT,ObjType COLLATE DATABASE_DEFAULT,SchemaName COLLATE DATABASE_DEFAULT,TableName COLLATE DATABASE_DEFAULT,ColumnName COLLATE DATABASE_DEFAULT,ISNULL(MAX(ColRefCount),1),ISNULL(MAX(JoinCnt),0),ISNULL(MAX(InsertCnt),0),ISNULL(MAX(UpdateCnt),0),ISNULL(MAX(DeleteCnt),0),1
+    FROM #TxtOM GROUP BY ObjName,ObjType,SchemaName,TableName,ColumnName HAVING ISNULL(MAX(ColRefCount),1)>=1;
+
+    DROP TABLE #TxtTbl; DROP TABLE #Alias; DROP TABLE #TxtOM; DROP TABLE #TxtChg;
+END
+
+DROP TABLE #Dep; DROP TABLE #Clause; DROP TABLE #NoDep;
+
+SkipParse:
+
+MERGE dbo.ObjectDiscoveryState AS tgt
+USING(SELECT @L AS DB,ObjName COLLATE DATABASE_DEFAULT AS ObjName,ObjType COLLATE DATABASE_DEFAULT AS ObjType,ObjHash FROM #OC)AS src
+ON tgt.DatabaseName=src.DB AND tgt.ObjectName=src.ObjName AND tgt.ObjectType=src.ObjType
+WHEN MATCHED AND tgt.ObjectHash<>src.ObjHash THEN UPDATE SET tgt.ObjectHash=src.ObjHash,tgt.LastParsed=SYSUTCDATETIME()
+WHEN NOT MATCHED BY TARGET THEN INSERT(DatabaseName,ObjectName,ObjectType,ObjectHash,LastParsed)VALUES(src.DB,src.ObjName,src.ObjType,src.ObjHash,SYSUTCDATETIME())
+WHEN NOT MATCHED BY SOURCE AND tgt.DatabaseName=@L THEN DELETE;
+
+DROP TABLE #OChg; DROP TABLE #OC;';
+
+        BEGIN TRY EXEC sp_executesql @SQL; PRINT N'  [PHASE 2A] '+@DB+N' OK'; END TRY
+        BEGIN CATCH INSERT dbo.DiscoveryErrorLog(Phase,DatabaseName,ErrorMessage)VALUES(N'PHASE 2A',@DB,ERROR_MESSAGE()); END CATCH;
+        FETCH NEXT FROM db_cur INTO @DB;
+    END
+    CLOSE db_cur; DEALLOCATE db_cur;
+
+    UPDATE ods SET ReferenceCount=cnt.Cnt FROM dbo.ObjectDiscoveryState ods JOIN(SELECT DatabaseName,ObjectName,ObjectType,COUNT(*)AS Cnt FROM dbo.ObjectReferenceEvidence GROUP BY DatabaseName,ObjectName,ObjectType)cnt ON cnt.DatabaseName=ods.DatabaseName AND cnt.ObjectName=ods.ObjectName AND cnt.ObjectType=ods.ObjectType;
+
+    TRUNCATE TABLE dbo.ObjectReferenceSummary;
+    INSERT dbo.ObjectReferenceSummary(DatabaseName,ReferencedSchema,ReferencedTable,ReferencedColumn,ViewCount,ProcedureCount,FunctionCount,TriggerCount,TotalObjectCount,TotalJoinRef,TotalInsertRef,TotalUpdateRef,TotalDeleteRef,TotalUsingJoins,ClauseContextMask)
+    SELECT ore.DatabaseName,ore.ReferencedSchema,ore.ReferencedTable,ore.ReferencedColumn,SUM(CASE WHEN ore.ObjectType=N'VIEW' THEN 1 ELSE 0 END),SUM(CASE WHEN ore.ObjectType=N'SQL_STORED_PROCEDURE' THEN 1 ELSE 0 END),SUM(CASE WHEN ore.ObjectType LIKE N'%FUNCTION%' THEN 1 ELSE 0 END),SUM(CASE WHEN ore.ObjectType LIKE N'%TRIGGER%' THEN 1 ELSE 0 END),COUNT(DISTINCT ore.ObjectName),SUM(ore.JoinCount),SUM(ore.InsertCount),SUM(ore.UpdateCount),SUM(ore.DeleteCount),SUM(CASE WHEN ore.UsingJoins = 1 THEN 1 ELSE 0 END),MAX(ore.ClauseContext)|MIN(ore.ClauseContext)
+    FROM dbo.ObjectReferenceEvidence ore GROUP BY ore.DatabaseName,ore.ReferencedSchema,ore.ReferencedTable,ore.ReferencedColumn;
+END
+ELSE PRINT N'[PHASE 2A] Disabled.';
+DECLARE @Msg NVARCHAR(MAX) = (SELECT CAST(COUNT(*)AS NVARCHAR(10))+N' | Summary: '+CAST((SELECT COUNT(*)FROM dbo.ObjectReferenceSummary)AS NVARCHAR(10)) FROM dbo.ObjectReferenceEvidence);
+PRINT N'[PHASE 2A] ObjectRefs: '+@Msg;
+GO
+
+-- ═══ PHASE 2B: COLUMN RELATIONSHIP EVIDENCE ═══
+PRINT N'[PHASE 2B] Column Relationship Evidence...';
+DECLARE @MaxFreq INT=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_MaxColumnFrequency'),N'50')AS INT);
+DECLARE @MinLen INT=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_MinColumnNameLength'),N'4')AS INT);
+DECLARE @SfxThresh INT=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_MinSuffixTableCount'),N'3')AS INT);
+
+IF OBJECT_ID('tempdb..#ExcCols')IS NOT NULL DROP TABLE #ExcCols;
+SELECT UPPER(ColumnName) AS ColName INTO #ExcCols FROM dbo.VirtualFKExcludedColumns;
+IF OBJECT_ID('tempdb..#HighFreq')IS NOT NULL DROP TABLE #HighFreq;
+SELECT DatabaseName,ColumnName INTO #HighFreq FROM dbo.TableColumns GROUP BY DatabaseName,ColumnName HAVING COUNT(DISTINCT SchemaName+N'.'+TableName)>@MaxFreq;
+CREATE INDEX IX_HF ON #HighFreq(DatabaseName,ColumnName);
+IF OBJECT_ID('tempdb..#Suffix')IS NOT NULL DROP TABLE #Suffix;
+SELECT DatabaseName,ColumnName AS Suffix INTO #Suffix FROM dbo.vwSingleColumnPKs GROUP BY DatabaseName,ColumnName HAVING COUNT(DISTINCT SchemaName+N'.'+TableName)>=@SfxThresh;
+IF OBJECT_ID('tempdb..#ExistingFK')IS NOT NULL DROP TABLE #ExistingFK;
+SELECT DatabaseName,SchemaName,TableName,FKColumns INTO #ExistingFK FROM dbo.TableFKDetails;
+CREATE INDEX IX_EFK ON #ExistingFK(DatabaseName,SchemaName,TableName,FKColumns);
+IF OBJECT_ID('tempdb..#IdxCols')IS NOT NULL DROP TABLE #IdxCols;
+SELECT idx.DatabaseName,idx.SchemaName,idx.TableName,LTRIM(RTRIM(REPLACE(REPLACE(c.value(N'.',N'NVARCHAR(128)'),N'[',N''),N']',N''))) AS ColumnName INTO #IdxCols FROM dbo.TableIndexes idx CROSS APPLY(SELECT CAST(N'<x>'+REPLACE(idx.KeyColumns,N',',N'</x><x>')+N'</x>' AS XML))x(raw) CROSS APPLY x.raw.nodes(N'/x')t(c);
+CREATE INDEX IX_IC ON #IdxCols(DatabaseName,SchemaName,TableName,ColumnName);
+IF OBJECT_ID('tempdb..#UniqIdxCols')IS NOT NULL DROP TABLE #UniqIdxCols;
+SELECT idx.DatabaseName,idx.SchemaName,idx.TableName,LTRIM(RTRIM(REPLACE(REPLACE(c.value(N'.',N'NVARCHAR(128)'),N'[',N''),N']',N''))) AS ColumnName INTO #UniqIdxCols FROM dbo.TableIndexes idx CROSS APPLY(SELECT CAST(N'<x>'+REPLACE(idx.KeyColumns,N',',N'</x><x>')+N'</x>' AS XML))x(raw) CROSS APPLY x.raw.nodes(N'/x')t(c) WHERE idx.IsUnique=1;
+CREATE INDEX IX_UIC ON #UniqIdxCols(DatabaseName,SchemaName,TableName,ColumnName);
+IF OBJECT_ID('tempdb..#IdxAgg')IS NOT NULL DROP TABLE #IdxAgg;
+SELECT DatabaseName,SchemaName,TableName,ColumnName,COUNT(*)AS Cnt INTO #IdxAgg FROM #IdxCols GROUP BY DatabaseName,SchemaName,TableName,ColumnName;
+IF OBJECT_ID('tempdb..#UniqAgg')IS NOT NULL DROP TABLE #UniqAgg;
+SELECT DISTINCT DatabaseName,SchemaName,TableName,ColumnName INTO #UniqAgg FROM #UniqIdxCols;
+
+;WITH C AS(SELECT tc.DatabaseName,tc.SchemaName,tc.TableName,tc.ColumnName,tc.DataType,pk.SchemaName AS RefSchema,pk.TableName AS RefTable,pk.ColumnName AS RefCol FROM dbo.TableColumns tc JOIN dbo.DiscoveryDataTypeFamily dtf ON dtf.DataType=tc.DataType JOIN dbo.vwSingleColumnPKs pk ON pk.DatabaseName=tc.DatabaseName AND pk.ColumnName=tc.ColumnName AND pk.FamilyCode=dtf.FamilyCode AND NOT(pk.SchemaName=tc.SchemaName AND pk.TableName=tc.TableName) WHERE LEN(tc.ColumnName)>=@MinLen AND UPPER(tc.ColumnName)NOT IN(SELECT ColName FROM #ExcCols) AND NOT EXISTS(SELECT 1 FROM #HighFreq hf WHERE hf.DatabaseName=tc.DatabaseName AND hf.ColumnName=tc.ColumnName) AND NOT EXISTS(SELECT 1 FROM dbo.TablePKColumns cpk WHERE cpk.DatabaseName=tc.DatabaseName AND cpk.SchemaName=tc.SchemaName AND cpk.TableName=tc.TableName AND cpk.ColumnName=tc.ColumnName) AND NOT EXISTS(SELECT 1 FROM #ExistingFK fk WHERE fk.DatabaseName=tc.DatabaseName AND fk.SchemaName=tc.SchemaName AND fk.TableName=tc.TableName AND(fk.FKColumns=QUOTENAME(tc.ColumnName)OR fk.FKColumns=tc.ColumnName)))
+INSERT dbo.ColumnRelationshipEvidence(DatabaseName,SchemaName,TableName,FKColumn,ReferencedSchema,ReferencedTable,ReferencedColumn,SameName,SameDatatype,SameDatatypeFamily,CompositeName,SupportingIndexCount,ReferencedByUniqueConstraint)
+SELECT DISTINCT c.DatabaseName,c.SchemaName,c.TableName,c.ColumnName,c.RefSchema,c.RefTable,c.RefCol,1,CASE WHEN c.DataType=p.DataType THEN 1 ELSE 0 END,1,0,ISNULL(ia.Cnt,0),CASE WHEN ua.ColumnName IS NOT NULL THEN 1 ELSE 0 END
+FROM C c JOIN dbo.TablePKColumns p ON p.DatabaseName=c.DatabaseName AND p.SchemaName=c.RefSchema AND p.TableName=c.RefTable AND p.ColumnName=c.RefCol LEFT JOIN #IdxAgg ia ON ia.DatabaseName=c.DatabaseName AND ia.SchemaName=c.SchemaName AND ia.TableName=c.TableName AND ia.ColumnName=c.ColumnName LEFT JOIN #UniqAgg ua ON ua.DatabaseName=c.DatabaseName AND ua.SchemaName=c.RefSchema AND ua.TableName=c.RefTable AND ua.ColumnName=c.RefCol;
+DECLARE @s1 INT=@@ROWCOUNT;
+
+;WITH C AS(SELECT tc.DatabaseName,tc.SchemaName,tc.TableName,tc.ColumnName,tc.DataType,pk.SchemaName AS RefSchema,pk.TableName AS RefTable,pk.ColumnName AS RefCol FROM dbo.TableColumns tc JOIN dbo.DiscoveryDataTypeFamily dtf ON dtf.DataType=tc.DataType JOIN dbo.vwSingleColumnPKs pk ON pk.DatabaseName=tc.DatabaseName AND tc.ColumnName=pk.TableName+pk.ColumnName AND tc.ColumnName<>pk.ColumnName AND pk.FamilyCode=dtf.FamilyCode AND NOT(pk.SchemaName=tc.SchemaName AND pk.TableName=tc.TableName) WHERE pk.ColumnName IN(SELECT Suffix FROM #Suffix s WHERE s.DatabaseName=pk.DatabaseName) AND LEN(pk.TableName+pk.ColumnName)>=@MinLen AND UPPER(tc.ColumnName)NOT IN(SELECT ColName FROM #ExcCols) AND NOT EXISTS(SELECT 1 FROM #HighFreq hf WHERE hf.DatabaseName=tc.DatabaseName AND hf.ColumnName=tc.ColumnName) AND NOT EXISTS(SELECT 1 FROM dbo.TablePKColumns cpk WHERE cpk.DatabaseName=tc.DatabaseName AND cpk.SchemaName=tc.SchemaName AND cpk.TableName=tc.TableName AND cpk.ColumnName=tc.ColumnName) AND NOT EXISTS(SELECT 1 FROM #ExistingFK fk WHERE fk.DatabaseName=tc.DatabaseName AND fk.SchemaName=tc.SchemaName AND fk.TableName=tc.TableName AND(fk.FKColumns=QUOTENAME(tc.ColumnName)OR fk.FKColumns=tc.ColumnName)) AND NOT EXISTS(SELECT 1 FROM dbo.ColumnRelationshipEvidence v WHERE v.DatabaseName=tc.DatabaseName AND v.SchemaName=tc.SchemaName AND v.TableName=tc.TableName AND v.FKColumn=tc.ColumnName))
+INSERT dbo.ColumnRelationshipEvidence(DatabaseName,SchemaName,TableName,FKColumn,ReferencedSchema,ReferencedTable,ReferencedColumn,SameName,SameDatatype,SameDatatypeFamily,CompositeName,SupportingIndexCount,ReferencedByUniqueConstraint)
+SELECT DISTINCT c.DatabaseName,c.SchemaName,c.TableName,c.ColumnName,c.RefSchema,c.RefTable,c.RefCol,0,CASE WHEN c.DataType=p.DataType THEN 1 ELSE 0 END,1,1,ISNULL(ia.Cnt,0),CASE WHEN ua.ColumnName IS NOT NULL THEN 1 ELSE 0 END
+FROM C c JOIN dbo.TablePKColumns p ON p.DatabaseName=c.DatabaseName AND p.SchemaName=c.RefSchema AND p.TableName=c.RefTable AND p.ColumnName=c.RefCol LEFT JOIN #IdxAgg ia ON ia.DatabaseName=c.DatabaseName AND ia.SchemaName=c.SchemaName AND ia.TableName=c.TableName AND ia.ColumnName=c.ColumnName LEFT JOIN #UniqAgg ua ON ua.DatabaseName=c.DatabaseName AND ua.SchemaName=c.RefSchema AND ua.TableName=c.RefTable AND ua.ColumnName=c.RefCol;
+DECLARE @s2 INT=@@ROWCOUNT;
+
+UPDATE cre SET cre.ObjectReferenceCount=ISNULL(ors.TotalObjectCount,0) FROM dbo.ColumnRelationshipEvidence cre LEFT JOIN dbo.ObjectReferenceSummary ors ON ors.DatabaseName=cre.DatabaseName AND ors.ReferencedSchema=cre.ReferencedSchema AND ors.ReferencedTable=cre.ReferencedTable AND ors.ReferencedColumn=cre.ReferencedColumn;
+
+DROP TABLE #ExcCols; DROP TABLE #HighFreq; DROP TABLE #Suffix; DROP TABLE #ExistingFK; DROP TABLE #IdxCols; DROP TABLE #UniqIdxCols; DROP TABLE #IdxAgg; DROP TABLE #UniqAgg;
+PRINT N'[PHASE 2B] SameName: '+CAST(@s1 AS NVARCHAR(10))+N' | Composite: '+CAST(@s2 AS NVARCHAR(10))+N' | Total: '+CAST(@s1+@s2 AS NVARCHAR(10));
+GO
+
+-- ═══ PHASE 2C: DATA VALIDATION ═══
+PRINT N'[PHASE 2C] Data Validation...';
+DELETE v FROM dbo.ColumnRelationshipEvidence v WHERE NOT EXISTS(SELECT 1 FROM dbo.TableDetails td WHERE td.DatabaseName=v.DatabaseName AND td.SchemaName=v.SchemaName AND td.TableName=v.TableName AND td.HasData=1);
+DECLARE @EvFilter BIT=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_EnableEvidenceFilter'),N'0')AS BIT);
+DECLARE @MinEv INT=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_MinEvidence'),N'25')AS INT);
+DECLARE @vc INT=(SELECT COUNT(*)FROM dbo.ColumnRelationshipEvidence);
+PRINT N'  [PHASE 2C] Rows to validate: '+CAST(@vc AS NVARCHAR(20));
+IF @vc>0
+BEGIN
+    DECLARE @vdb SYSNAME,@vsch SYSNAME,@vtbl SYSNAME;
+    DECLARE @vEvid INT,@vcol SYSNAME,@vrsch SYSNAME,@vrtbl SYSNAME,@vrcol SYSNAME;
+    DECLARE @vsql NVARCHAR(MAX),@nnr BIGINT,@ndk BIGINT,@nor BIGINT;
+    DECLARE @vn INT=0,@vtot INT;
+    SELECT @vtot=COUNT(DISTINCT DatabaseName+N'|'+SchemaName+N'|'+TableName)FROM dbo.ColumnRelationshipEvidence;
+    DECLARE tc CURSOR LOCAL FAST_FORWARD FOR
+        SELECT DISTINCT cre.DatabaseName,cre.SchemaName,cre.TableName
+        FROM dbo.ColumnRelationshipEvidence cre
+        WHERE @EvFilter=0 OR(
+            CASE WHEN cre.SameName=1 THEN 20 ELSE 0 END
+            +CASE WHEN cre.SameDatatype=1 THEN 15 ELSE 0 END
+            +CASE WHEN cre.SameDatatypeFamily=1 AND cre.SameDatatype=0 THEN 5 ELSE 0 END
+            +CASE WHEN cre.CompositeName=1 THEN 15 ELSE 0 END
+            +CASE WHEN cre.SupportingIndexCount>0 THEN 10 ELSE 0 END
+            +CASE WHEN cre.ReferencedByUniqueConstraint=1 THEN 10 ELSE 0 END
+            +CASE WHEN cre.ObjectReferenceCount>0 THEN 15 ELSE 0 END)>=@MinEv;
+    OPEN tc; FETCH NEXT FROM tc INTO @vdb,@vsch,@vtbl;
+    WHILE @@FETCH_STATUS=0
+    BEGIN
+        SET @vn+=1; IF @vn%50=0 RAISERROR(N'  [PHASE 2C] %d/%d',0,1,@vn,@vtot) WITH NOWAIT;
+        DECLARE cc CURSOR LOCAL FAST_FORWARD FOR
+            SELECT EvidenceId,FKColumn,ReferencedSchema,ReferencedTable,ReferencedColumn
+            FROM dbo.ColumnRelationshipEvidence
+            WHERE DatabaseName=@vdb AND SchemaName=@vsch AND TableName=@vtbl;
+        OPEN cc; FETCH NEXT FROM cc INTO @vEvid,@vcol,@vrsch,@vrtbl,@vrcol;
+        WHILE @@FETCH_STATUS=0
+        BEGIN
+            SET @vsql=N'SELECT @oN=COUNT_BIG(CASE WHEN c.'+QUOTENAME(@vcol)+N' IS NOT NULL THEN 1 END),@oD=COUNT_BIG(DISTINCT CASE WHEN c.'+QUOTENAME(@vcol)+N' IS NOT NULL THEN c.'+QUOTENAME(@vcol)+N' END),@oO=COUNT_BIG(CASE WHEN c.'+QUOTENAME(@vcol)+N' IS NOT NULL AND r.'+QUOTENAME(@vrcol)+N' IS NULL THEN 1 END) FROM '+QUOTENAME(@vdb)+N'.'+QUOTENAME(@vsch)+N'.'+QUOTENAME(@vtbl)+N' c LEFT JOIN '+QUOTENAME(@vdb)+N'.'+QUOTENAME(@vrsch)+N'.'+QUOTENAME(@vrtbl)+N' r ON c.'+QUOTENAME(@vcol)+N'=r.'+QUOTENAME(@vrcol);
+            SET @nnr=NULL; SET @ndk=NULL; SET @nor=NULL;
+            BEGIN TRY
+                EXEC sp_executesql @vsql,N'@oN BIGINT OUTPUT,@oD BIGINT OUTPUT,@oO BIGINT OUTPUT',@oN=@nnr OUTPUT,@oD=@ndk OUTPUT,@oO=@nor OUTPUT;
+                UPDATE dbo.ColumnRelationshipEvidence SET ChildNonNullRows=@nnr,DistinctChildKeys=@ndk,OrphanRows=@nor,MatchCoveragePct=CASE WHEN @nnr=0 THEN NULL ELSE CAST(((@nnr-@nor)*100.0/@nnr)AS DECIMAL(9,4))END WHERE EvidenceId=@vEvid;
+            END TRY
+            BEGIN CATCH INSERT dbo.DiscoveryErrorLog(Phase,DatabaseName,SchemaName,TableName,ErrorMessage)VALUES(N'PHASE 2C',@vdb,@vsch,@vtbl,ERROR_MESSAGE()); END CATCH;
+            FETCH NEXT FROM cc INTO @vEvid,@vcol,@vrsch,@vrtbl,@vrcol;
+        END
+        CLOSE cc; DEALLOCATE cc;
+        FETCH NEXT FROM tc INTO @vdb,@vsch,@vtbl;
+    END
+    CLOSE tc; DEALLOCATE tc;
+END
+PRINT N'[PHASE 2C] Complete.';
+GO
+
+-- ═══ PHASE 2D: VFK PROMOTION ═══
+PRINT N'[PHASE 2D] VFK Promotion...';
+IF OBJECT_ID('dbo.VirtualFKDetails','U') IS NOT NULL DROP TABLE dbo.VirtualFKDetails;
+CREATE TABLE dbo.VirtualFKDetails(
+    VFKId INT IDENTITY PRIMARY KEY,
+    DatabaseName SYSNAME NOT NULL,
+    SchemaName SYSNAME NOT NULL,
+    TableName SYSNAME NOT NULL,
+    FKColumn SYSNAME NOT NULL,
+    ReferencedSchema SYSNAME NOT NULL,
+    ReferencedTable SYSNAME NOT NULL,
+    ReferencedColumn SYSNAME NOT NULL,
+    EvidenceScore INT NOT NULL,
+    MatchCoveragePct DECIMAL(9,4) NULL,
+    OrphanRows BIGINT NULL,
+    DistinctChildKeys BIGINT NULL,
+    GatedBy NVARCHAR(16) NOT NULL, -- 'Evidence' or 'Sample'
+    IsPromoted BIT NOT NULL DEFAULT 1,
+    IsSelfReference BIT NOT NULL DEFAULT 0,
+    CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT UQ_VFKDetails UNIQUE(DatabaseName,SchemaName,TableName,FKColumn));
+GO
+DECLARE @MinEv2 INT=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_MinEvidence'),N'25')AS INT);
+DECLARE @MinRows2 INT=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_MinRows'),N'10')AS INT);
+DECLARE @MinDistinct2 INT=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_MinDistinct'),N'2')AS INT);
+DECLARE @MaxOrphan2 DECIMAL(9,4)=CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName=N'VirtualFK_MaxOrphanPct'),N'10')AS DECIMAL(9,4));
+
+IF OBJECT_ID('tempdb..#VFKScored')IS NOT NULL DROP TABLE #VFKScored;
+SELECT cre.EvidenceId,cre.DatabaseName,cre.SchemaName,cre.TableName,cre.FKColumn,
+    cre.ReferencedSchema,cre.ReferencedTable,cre.ReferencedColumn,
+    cre.MatchCoveragePct,cre.OrphanRows,cre.DistinctChildKeys,
+    (CASE WHEN cre.SameName=1 THEN 20 ELSE 0 END
+    +CASE WHEN cre.SameDatatype=1 THEN 15 ELSE 0 END
+    +CASE WHEN cre.SameDatatypeFamily=1 AND cre.SameDatatype=0 THEN 5 ELSE 0 END
+    +CASE WHEN cre.CompositeName=1 THEN 15 ELSE 0 END
+    +CASE WHEN cre.SupportingIndexCount>0 THEN 10 ELSE 0 END
+    +CASE WHEN cre.ReferencedByUniqueConstraint=1 THEN 10 ELSE 0 END
+    +CASE WHEN cre.ObjectReferenceCount>0 THEN 15 ELSE 0 END) AS EvidenceScore
+INTO #VFKScored
+FROM dbo.ColumnRelationshipEvidence cre;
+
+-- Gate: pass on evidence score alone; only fall back to the sample-quality
+-- check (rows/distinct/orphan%) when the evidence score isn't already decisive.
+IF OBJECT_ID('tempdb..#VFKGated')IS NOT NULL DROP TABLE #VFKGated;
+SELECT *,
+    CASE WHEN EvidenceScore>=@MinEv2 THEN N'Evidence' ELSE N'Sample' END AS GatedBy
+INTO #VFKGated
+FROM #VFKScored
+WHERE EvidenceScore>=@MinEv2
+   OR (ISNULL(DistinctChildKeys,0)>=@MinDistinct2
+       AND ISNULL(DistinctChildKeys,0)>=@MinRows2
+       AND ISNULL(MatchCoveragePct,0)>=(100.0-@MaxOrphan2));
+
+-- Best parent only per (child table, FK column): highest score, then best coverage.
+IF OBJECT_ID('tempdb..#VFKBest')IS NOT NULL DROP TABLE #VFKBest;
+SELECT *,ROW_NUMBER()OVER(PARTITION BY DatabaseName,SchemaName,TableName,FKColumn
+    ORDER BY EvidenceScore DESC,ISNULL(MatchCoveragePct,0)DESC) AS rn
+INTO #VFKBest
+FROM #VFKGated;
+
+INSERT INTO dbo.VirtualFKDetails(DatabaseName,SchemaName,TableName,FKColumn,ReferencedSchema,ReferencedTable,ReferencedColumn,EvidenceScore,MatchCoveragePct,OrphanRows,DistinctChildKeys,GatedBy,IsPromoted,IsSelfReference)
+SELECT DatabaseName,SchemaName,TableName,FKColumn,ReferencedSchema,ReferencedTable,ReferencedColumn,EvidenceScore,MatchCoveragePct,OrphanRows,DistinctChildKeys,GatedBy,1,
+    CASE WHEN SchemaName=ReferencedSchema AND TableName=ReferencedTable THEN 1 ELSE 0 END
+FROM #VFKBest WHERE rn=1;
+
+DECLARE @vfkPromoted INT=@@ROWCOUNT;
+DROP TABLE #VFKScored; DROP TABLE #VFKGated; DROP TABLE #VFKBest;
+PRINT N'[PHASE 2D] VirtualFKDetails: '+CAST(@vfkPromoted AS NVARCHAR(20))+N' promoted.';
+GO
+
+-- ═══ PHASE 3: STATISTICS ═══
+PRINT N'[PHASE 3] Statistics...';
+INSERT dbo.TableStatistics(DatabaseName,SchemaName,TableName,[RowCount],HasPrimaryKey,PKDataType,CompositePK,HasBranchId,IsGuidPK)
+SELECT DatabaseName,SchemaName,TableName,[RowCount],CASE WHEN PKDataType IS NOT NULL THEN 1 ELSE 0 END,PKDataType,CompositePK,HasBranchId,IsGuidPK FROM dbo.TableDetails;
+GO
+
+DECLARE @SQL NVARCHAR(MAX),@DB SYSNAME,@P3Done INT=0,@P3Total INT;
+SELECT @P3Total=COUNT(*)FROM dbo.TableDetails td WHERE EXISTS(SELECT 1 FROM dbo.TablePKColumns pk WHERE pk.DatabaseName=td.DatabaseName AND pk.SchemaName=td.SchemaName AND pk.TableName=td.TableName);
+DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 ORDER BY Ord;
+OPEN db_cur; FETCH NEXT FROM db_cur INTO @DB;
+WHILE @@FETCH_STATUS=0 BEGIN
+DECLARE @Schema SYSNAME,@Table SYSNAME,@pkColList NVARCHAR(MAX),@pkColCount INT,@pkFirstColType NVARCHAR(128),@createdCol NVARCHAR(256);
+DECLARE tbl_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DISTINCT td.SchemaName,td.TableName FROM dbo.TableDetails td WHERE td.DatabaseName=@DB AND EXISTS(SELECT 1 FROM dbo.TablePKColumns pk WHERE pk.DatabaseName=td.DatabaseName AND pk.SchemaName=td.SchemaName AND pk.TableName=td.TableName);
+OPEN tbl_cur; FETCH NEXT FROM tbl_cur INTO @Schema,@Table;
+WHILE @@FETCH_STATUS=0 BEGIN
+SET @P3Done+=1; IF @P3Done%25=0 RAISERROR(N'  [PHASE 3] %d/%d tables...',0,1,@P3Done,@P3Total) WITH NOWAIT;
+SET @createdCol=NULL;
+SET @pkColList=NULL; SET @pkColCount=NULL; SET @pkFirstColType=NULL;
+SELECT @pkColList=STUFF((SELECT N', '+QUOTENAME(ColumnName)FROM dbo.TablePKColumns WHERE DatabaseName=@DB AND SchemaName=@Schema AND TableName=@Table ORDER BY Ordinal FOR XML PATH(''),TYPE).value('.','NVARCHAR(MAX)'),1,2,N'');
+SELECT @pkColCount=COUNT(*),@pkFirstColType=MAX(DataType) FROM dbo.TablePKColumns WHERE DatabaseName=@DB AND SchemaName=@Schema AND TableName=@Table;
+SELECT TOP 1 @createdCol=ColumnName FROM dbo.TableColumns WHERE DatabaseName=@DB AND SchemaName=@Schema AND TableName=@Table AND DataType IN('datetime','datetime2','smalldatetime','date') AND(ColumnName LIKE '%CreateDate%' OR ColumnName LIKE '%CreatedAt%' OR ColumnName LIKE '%CreationDate%' OR ColumnName LIKE '%DateCreated%' OR ColumnName LIKE '%InsertDate%' OR ColumnName LIKE '%CreatedOn%');
+SET @SQL=N'DECLARE @min BIGINT=NULL,@max BIGINT=NULL,@distinct BIGINT=NULL,@nulls BIGINT=NULL,@seed BIGINT=NULL,@incr BIGINT=NULL,@minDate DATETIME2=NULL,@maxDate DATETIME2=NULL;BEGIN TRY ';
+IF @pkColCount=1 SET @SQL=@SQL+N'SELECT @distinct=COUNT_BIG(DISTINCT '+@pkColList+N'),@nulls=SUM(CASE WHEN '+@pkColList+N' IS NULL THEN 1 ELSE 0 END)'+CASE WHEN @pkFirstColType IN('int','bigint','smallint','tinyint','decimal','numeric') THEN N',@min=ISNULL(MIN(CAST('+@pkColList+N' AS BIGINT)),0),@max=ISNULL(MAX(CAST('+@pkColList+N' AS BIGINT)),0)' ELSE N'' END+N' FROM '+QUOTENAME(@DB)+N'.'+QUOTENAME(@Schema)+N'.'+QUOTENAME(@Table)+N';';
+ELSE SET @SQL=@SQL+N'SELECT @nulls=SUM(CASE WHEN '+REPLACE(@pkColList,N',',N' IS NULL OR ')+N' IS NULL THEN 1 ELSE 0 END) FROM '+QUOTENAME(@DB)+N'.'+QUOTENAME(@Schema)+N'.'+QUOTENAME(@Table)+N';';
+SET @SQL=@SQL+N'SELECT TOP 1 @seed=CAST(seed_value AS BIGINT),@incr=CAST(increment_value AS BIGINT) FROM '+QUOTENAME(@DB)+N'.sys.identity_columns ic JOIN '+QUOTENAME(@DB)+N'.sys.tables t ON ic.object_id=t.object_id JOIN '+QUOTENAME(@DB)+N'.sys.schemas s ON t.schema_id=s.schema_id WHERE s.name=N'''+REPLACE(@Schema,'''','''''')+N''' AND t.name=N'''+REPLACE(@Table,'''','''''')+N''';';
+IF @createdCol IS NOT NULL SET @SQL=@SQL+N'SELECT @minDate=MIN('+QUOTENAME(@createdCol)+N'),@maxDate=MAX('+QUOTENAME(@createdCol)+N') FROM '+QUOTENAME(@DB)+N'.'+QUOTENAME(@Schema)+N'.'+QUOTENAME(@Table)+N' WHERE '+QUOTENAME(@createdCol)+N' IS NOT NULL;';
+SET @SQL=@SQL+N'END TRY BEGIN CATCH END CATCH;UPDATE dbo.TableStatistics SET MinPK=@min,MaxPK=@max,DistinctPKCount=@distinct,NullPKCount=@nulls,IdentitySeed=@seed,IdentityIncrement=@incr,MinCreatedDate=@minDate,MaxCreatedDate=@maxDate,CreatedDateColumn='+CASE WHEN @createdCol IS NULL THEN N'NULL' ELSE N'N'''+REPLACE(@createdCol,'''','''''')+N'''' END+N' WHERE DatabaseName=N'''+REPLACE(@DB,'''','''''')+N''' AND SchemaName=N'''+REPLACE(@Schema,'''','''''')+N''' AND TableName=N'''+REPLACE(@Table,'''','''''')+N''';';
+BEGIN TRY EXEC sp_executesql @SQL; END TRY BEGIN CATCH INSERT dbo.DiscoveryErrorLog(Phase,DatabaseName,SchemaName,TableName,ErrorMessage)VALUES(N'PHASE 3',@DB,@Schema,@Table,ERROR_MESSAGE()); END CATCH;
+FETCH NEXT FROM tbl_cur INTO @Schema,@Table; END CLOSE tbl_cur; DEALLOCATE tbl_cur;
+FETCH NEXT FROM db_cur INTO @DB; END CLOSE db_cur; DEALLOCATE db_cur;
+DECLARE @Msg NVARCHAR(MAX) = CAST((SELECT COUNT(*)FROM dbo.TableStatistics)AS NVARCHAR(20));
+PRINT N'[PHASE 3] Stats: '+@Msg;
+GO
+
+-- ═══ PHASE 4: SAMPLES ═══
+PRINT N'[PHASE 4] Samples...';
+TRUNCATE TABLE dbo.TableSamples;
+DECLARE @SQL NVARCHAR(MAX),@Schema SYSNAME,@Table SYSNAME,@DB SYSNAME,@OrderBy NVARCHAR(MAX),@SafeColList NVARCHAR(MAX),@P4Done INT=0,@P4Total INT=(SELECT COUNT(*)FROM dbo.TableDetails);
+DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 AND IsTemplate=1 ORDER BY Ord;
+OPEN db_cur; FETCH NEXT FROM db_cur INTO @DB;
+WHILE @@FETCH_STATUS=0 BEGIN
+DECLARE tbl_cur CURSOR LOCAL FAST_FORWARD FOR SELECT SchemaName,TableName FROM dbo.TableDetails WHERE DatabaseName=@DB AND HasData=1;
+OPEN tbl_cur; FETCH NEXT FROM tbl_cur INTO @Schema,@Table;
+WHILE @@FETCH_STATUS=0 BEGIN
+SET @P4Done+=1; IF @P4Done%25=0 RAISERROR(N'  [PHASE 4] %d/%d tables...',0,1,@P4Done,@P4Total) WITH NOWAIT;
+SET @OrderBy=N''; SELECT @OrderBy=N' ORDER BY '+STUFF((SELECT N', '+QUOTENAME(ColumnName)FROM dbo.TablePKColumns WHERE DatabaseName=@DB AND SchemaName=@Schema AND TableName=@Table ORDER BY Ordinal FOR XML PATH(''),TYPE).value('.','NVARCHAR(MAX)'),1,2,N'') WHERE EXISTS(SELECT 1 FROM dbo.TablePKColumns WHERE DatabaseName=@DB AND SchemaName=@Schema AND TableName=@Table);
+SET @SafeColList=NULL; DECLARE @ColListSql NVARCHAR(MAX)=N'SELECT @cols=STUFF((SELECT N'', ''+QUOTENAME(c.name)FROM '+QUOTENAME(@DB)+N'.sys.columns c JOIN '+QUOTENAME(@DB)+N'.sys.types t ON c.user_type_id=t.user_type_id WHERE c.object_id=OBJECT_ID(N'''+REPLACE(@Schema,'''','''''')+N'.'+REPLACE(@Table,'''','''''')+N''')AND t.name NOT IN(N''xml'',N''image'',N''text'',N''ntext'',N''sql_variant'',N''timestamp'',N''rowversion'',N''geography'',N''geometry'',N''hierarchyid'',N''table'')ORDER BY c.column_id FOR XML PATH(''''),TYPE).value(''.'',''NVARCHAR(MAX)''),1,2,N'''');';
+BEGIN TRY EXEC sp_executesql @ColListSql,N'@cols NVARCHAR(MAX) OUTPUT',@cols=@SafeColList OUTPUT; END TRY BEGIN CATCH SET @SafeColList=N''; END CATCH;
+IF @SafeColList IS NULL OR @SafeColList=N'' SET @SafeColList=N'1 AS Dummy';
+SET @SQL=N'DECLARE @j NVARCHAR(MAX),@rc BIGINT;BEGIN TRY;SELECT @rc=COUNT_BIG(*)FROM '+QUOTENAME(@DB)+N'.'+QUOTENAME(@Schema)+N'.'+QUOTENAME(@Table)+N';SET @j=(SELECT TOP 10 '+@SafeColList+N' FROM '+QUOTENAME(@DB)+N'.'+QUOTENAME(@Schema)+N'.'+QUOTENAME(@Table)+N' '+@OrderBy+N' FOR JSON PATH,INCLUDE_NULL_VALUES);END TRY BEGIN CATCH SET @j=N''{"error":"''+REPLACE(ERROR_MESSAGE(),N'''''''',N''""'')+N''"}'';SET @rc=-1;END CATCH;INSERT dbo.TableSamples(DatabaseName,SchemaName,TableName,SampleJSON,[RowCount])VALUES(N'''+@DB+N''',N'''+@Schema+N''',N'''+@Table+N''',@j,@rc);';
+BEGIN TRY EXEC sp_executesql @SQL; END TRY BEGIN CATCH INSERT dbo.DiscoveryErrorLog(Phase,DatabaseName,SchemaName,TableName,ErrorMessage)VALUES(N'PHASE 4',@DB,@Schema,@Table,ERROR_MESSAGE()); END CATCH;
+FETCH NEXT FROM tbl_cur INTO @Schema,@Table; END CLOSE tbl_cur; DEALLOCATE tbl_cur;
+FETCH NEXT FROM db_cur INTO @DB; END CLOSE db_cur; DEALLOCATE db_cur;
+DECLARE @Msg NVARCHAR(MAX) = CAST((SELECT COUNT(*)FROM dbo.TableSamples)AS NVARCHAR(20));
+PRINT N'[PHASE 4] Samples: '+@Msg;
+GO
+
+-- ═══ PHASE 5: INDEXES ═══
+PRINT N'[PHASE 5] Indexes...';
+DECLARE @DB SYSNAME,@SQL NVARCHAR(MAX);
+DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 ORDER BY Ord;
+OPEN db_cur; FETCH NEXT FROM db_cur INTO @DB;
+WHILE @@FETCH_STATUS=0 BEGIN
+SET @SQL=N'INSERT dbo.TableIndexes(DatabaseName,SchemaName,TableName,IndexName,IsUnique,IsPrimaryKey,KeyColumns) SELECT N'''+REPLACE(@DB,'''','''''')+N''',s.name,t.name,i.name,i.is_unique,i.is_primary_key,STUFF((SELECT N'', ''+QUOTENAME(c.name)FROM '+QUOTENAME(@DB)+N'.sys.index_columns ic JOIN '+QUOTENAME(@DB)+N'.sys.columns c ON ic.object_id=c.object_id AND ic.column_id=c.column_id WHERE ic.object_id=i.object_id AND ic.index_id=i.index_id AND ic.is_included_column=0 ORDER BY ic.key_ordinal FOR XML PATH(''''),TYPE).value(''.'',''nvarchar(max)''),1,1,'''') FROM '+QUOTENAME(@DB)+N'.sys.indexes i JOIN '+QUOTENAME(@DB)+N'.sys.tables t ON i.object_id=t.object_id JOIN '+QUOTENAME(@DB)+N'.sys.schemas s ON t.schema_id=s.schema_id WHERE t.is_ms_shipped=0 AND i.type IN(1,2)AND i.name IS NOT NULL;';
+BEGIN TRY EXEC sp_executesql @SQL; PRINT N'  [PHASE 5] '+@DB+N' OK'; END TRY BEGIN CATCH INSERT dbo.DiscoveryErrorLog(Phase,DatabaseName,ErrorMessage)VALUES(N'PHASE 5',@DB,ERROR_MESSAGE()); END CATCH;
+FETCH NEXT FROM db_cur INTO @DB; END CLOSE db_cur; DEALLOCATE db_cur;
+DECLARE @Msg NVARCHAR(MAX) = CAST((SELECT COUNT(*)FROM dbo.TableIndexes)AS NVARCHAR(20));
+PRINT N'[PHASE 5] Indexes: '+@Msg;
+GO
+
+-- ═══ PHASE 5B: MATERIALIZATION ═══
+PRINT N'[PHASE 5B] Materializing candidate columns...';
+TRUNCATE TABLE dbo.DiscoveryCandidateColumns;
+INSERT dbo.DiscoveryCandidateColumns(DatabaseName,SchemaName,TableName,ColumnName,Source)
+SELECT DatabaseName,SchemaName,TableName,ColumnName,
+    CASE WHEN SUM(CASE WHEN Source=N'PK' THEN 1 ELSE 0 END)>0 THEN N'PK'
+         WHEN SUM(CASE WHEN Source=N'FKChild' THEN 1 ELSE 0 END)>0 THEN N'FKChild'
+         WHEN SUM(CASE WHEN Source=N'FKParent' THEN 1 ELSE 0 END)>0 THEN N'FKParent'
+         WHEN SUM(CASE WHEN Source=N'Index' THEN 1 ELSE 0 END)>0 THEN N'Index'
+         ELSE N'FKRef' END AS Source
+FROM(
+    SELECT DatabaseName,SchemaName,TableName,ColumnName,N'PK' AS Source FROM dbo.TablePKColumns
+    UNION ALL
+    SELECT idx.DatabaseName,idx.SchemaName,idx.TableName,LTRIM(RTRIM(REPLACE(REPLACE(c.value(N'.',N'NVARCHAR(128)'),N'[',N''),N']',N''))),N'Index'
+    FROM dbo.TableIndexes idx CROSS APPLY(SELECT CAST(N'<x>'+REPLACE(idx.KeyColumns,N',',N'</x><x>')+N'</x>' AS XML))x(raw) CROSS APPLY x.raw.nodes(N'/x')t(c)
+    UNION ALL
+    SELECT DatabaseName,SchemaName,TableName,ColumnName,N'FKRef' FROM dbo.TableColumns WHERE UPPER(ColumnName)LIKE N'%ID' AND LEN(ColumnName)>=4
+    UNION ALL
+    SELECT DatabaseName,SchemaName,TableName,REPLACE(REPLACE(FKColumns,N'[',N''),N']',N''),N'FKChild' FROM dbo.TableFKDetails WHERE FKColumns IS NOT NULL
+    UNION ALL
+    SELECT DatabaseName,ReferencedSchema,ReferencedTable,REPLACE(REPLACE(ReferencedColumns,N'[',N''),N']',N''),N'FKParent' FROM dbo.TableFKDetails WHERE ReferencedColumns IS NOT NULL AND ReferencedSchema IS NOT NULL
+)cand
+GROUP BY DatabaseName,SchemaName,TableName,ColumnName;
+PRINT N'[PHASE 5B] Candidate columns: '+CAST(@@ROWCOUNT AS NVARCHAR(20));
+GO
+-- ═══ PHASE 6: SUMMARY ═══
+PRINT N'[PHASE 6] Summary...';
+INSERT dbo.DiscoverySummary(DatabaseName,TotalTables,TotalFKs,TotalIndexes,TotalPKColumns,TablesWithBranchId,TablesWithCompositePK,TablesWithIdentity,TablesWithRowVersion,TablesWithGuidPK,TablesWithoutPrimaryKey,TablesWithData,MissingSamplesForTablesWithData,TotalRows)
+SELECT d.DatabaseName,COUNT(DISTINCT d.SchemaName+N'.'+d.TableName),ISNULL(fk.Cnt,0),ISNULL(ix.Cnt,0),ISNULL(pk.Cnt,0),SUM(CASE WHEN d.HasBranchId=1 THEN 1 ELSE 0 END),SUM(CASE WHEN d.CompositePK=1 THEN 1 ELSE 0 END),SUM(CASE WHEN d.HasIdentity=1 THEN 1 ELSE 0 END),SUM(CASE WHEN d.HasRowVersion=1 THEN 1 ELSE 0 END),SUM(CASE WHEN d.IsGuidPK=1 THEN 1 ELSE 0 END),SUM(CASE WHEN d.PKDataType IS NULL THEN 1 ELSE 0 END),SUM(CASE WHEN d.HasData=1 THEN 1 ELSE 0 END),0,SUM(d.[RowCount])
+FROM dbo.TableDetails d LEFT JOIN(SELECT DatabaseName,COUNT(*)AS Cnt FROM dbo.TableFKDetails GROUP BY DatabaseName)fk ON fk.DatabaseName=d.DatabaseName LEFT JOIN(SELECT DatabaseName,COUNT(*)AS Cnt FROM dbo.TableIndexes GROUP BY DatabaseName)ix ON ix.DatabaseName=d.DatabaseName LEFT JOIN(SELECT DatabaseName,COUNT(*)AS Cnt FROM dbo.TablePKColumns GROUP BY DatabaseName)pk ON pk.DatabaseName=d.DatabaseName GROUP BY d.DatabaseName,fk.Cnt,ix.Cnt,pk.Cnt;
+SELECT * FROM dbo.DiscoverySummary ORDER BY DatabaseName;
+GO
+
+-- ═══ PHASE 6B: COVERAGE REPORT ═══
+PRINT N'[PHASE 6B] Coverage Report...';
+DECLARE @CovTpl SYSNAME=(SELECT TOP 1 DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 AND IsTemplate=1);
+IF @CovTpl IS NULL SET @CovTpl=(SELECT TOP 1 DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 ORDER BY Ord);
+IF OBJECT_ID('tempdb..#TplTables')IS NOT NULL DROP TABLE #TplTables;
+SELECT DISTINCT SchemaName,TableName INTO #TplTables FROM dbo.TableDetails WHERE DatabaseName=@CovTpl;
+DECLARE @TplCount INT=(SELECT COUNT(*)FROM #TplTables);
+INSERT dbo.SourceCoverageMissingTables(DatabaseName,SchemaName,TableName)
+SELECT dc.DBName,tt.SchemaName,tt.TableName FROM dbo.DiscoveryConfig dc CROSS JOIN #TplTables tt WHERE dc.IsActive=1 AND dc.IsTemplate=0 AND NOT EXISTS(SELECT 1 FROM dbo.TableDetails td WHERE td.DatabaseName=dc.DBName AND td.SchemaName=tt.SchemaName AND td.TableName=tt.TableName);
+INSERT dbo.SourceCoverageReport(DatabaseName,TemplateTableCount,MatchedTableCount,MissingTableCount,CoveragePct)
+SELECT dc.DBName,@TplCount,@TplCount-ISNULL(m.MC,0),ISNULL(m.MC,0),ISNULL(CAST(100.0*(@TplCount-ISNULL(m.MC,0))/NULLIF(@TplCount,0) AS DECIMAL(5,2)),0)
+FROM dbo.DiscoveryConfig dc LEFT JOIN(SELECT DatabaseName,COUNT(*)AS MC FROM dbo.SourceCoverageMissingTables GROUP BY DatabaseName)m ON m.DatabaseName=dc.DBName WHERE dc.IsActive=1 AND dc.IsTemplate=0;
+SELECT * FROM dbo.SourceCoverageReport ORDER BY CoveragePct ASC;
+SELECT * FROM dbo.SourceCoverageMissingTables ORDER BY DatabaseName,SchemaName,TableName;
+DROP TABLE #TplTables;
+GO
+
+-- ═══ PHASE 6C: CROSS-DATABASE PRESENCE ═══
+PRINT N'[PHASE 6C] Cross-Database Presence...';
+DECLARE @cDef NVARCHAR(MAX)=N'',@iCol NVARCHAR(MAX)=N'',@sExp NVARCHAR(MAX)=N'',@rBit NVARCHAR(MAX)=N'';
+SELECT @cDef+=N', '+QUOTENAME(Alias)+N' BIT NOT NULL DEFAULT 0',@iCol+=N', '+QUOTENAME(Alias),@sExp+=N', MAX(CASE WHEN td.DatabaseName=N'''+REPLACE(DBName,'''','''''')+N''' THEN 1 ELSE 0 END) AS '+QUOTENAME(Alias),@rBit+=CASE WHEN DatabaseRole=N'Region' THEN N'+CAST('+QUOTENAME(Alias)+N' AS INT)' ELSE N'' END
+FROM(SELECT DBName,DatabaseRole,CASE WHEN IsTemplate=1 THEN N'ExistsInTemplate' WHEN IsHO=1 THEN N'ExistsInHO' ELSE N'ExistsIn'+CASE WHEN DBName LIKE N'db%' THEN STUFF(DBName,1,2,N'') ELSE DBName END END AS Alias FROM dbo.DiscoveryConfig WHERE IsActive=1)C;
+DECLARE @rc NVARCHAR(200)=ISNULL(STUFF(@rBit,1,1,N''),N'0');
+DECLARE @sql NVARCHAR(MAX)=N'CREATE TABLE dbo.TablePresence(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL'+@cDef+N',RegionCount AS ('+@rc+N'),CONSTRAINT PK_TablePresence PRIMARY KEY(SchemaName,TableName));';
+EXEC sp_executesql @sql;
+SET @sql=N'INSERT dbo.TablePresence(SchemaName,TableName'+@iCol+N')SELECT td.SchemaName,td.TableName'+@sExp+N' FROM dbo.TableDetails td GROUP BY td.SchemaName,td.TableName;';
+EXEC sp_executesql @sql;
+DECLARE @Msg NVARCHAR(MAX) = CAST((SELECT COUNT(*)FROM dbo.TablePresence)AS NVARCHAR(20));
+PRINT N'[PHASE 6C] Presence records: '+@Msg;
+GO
+
+-- ═══ PHASE 7: SCHEMA DRIFT ═══
+PRINT N'[PHASE 7] Schema Drift...';
+INSERT dbo.SchemaDriftMatrix(SchemaName,TableName,ColumnName,DriftType,DriftSeverity)
+SELECT SchemaName,TableName,ColumnName,N'TYPE_MISMATCH',N'ERROR'
+FROM dbo.TableColumns GROUP BY SchemaName,TableName,ColumnName HAVING COUNT(DISTINCT DataType)>1;
+INSERT dbo.SchemaDriftMatrix(SchemaName,TableName,ColumnName,DriftType,DriftSeverity)
+SELECT d.SchemaName,d.TableName,d.ColumnName,N'NULLABLE_MISMATCH',N'WARNING'
+FROM(SELECT SchemaName,TableName,ColumnName FROM dbo.TableColumns GROUP BY SchemaName,TableName,ColumnName HAVING COUNT(DISTINCT CAST(IsNullable AS INT))>1)d
+WHERE NOT EXISTS(SELECT 1 FROM dbo.SchemaDriftMatrix s WHERE s.SchemaName=d.SchemaName AND s.TableName=d.TableName AND s.ColumnName=d.ColumnName);
+DECLARE @Msg NVARCHAR(MAX) = CAST((SELECT COUNT(*)FROM dbo.SchemaDriftMatrix)AS NVARCHAR(20));
+PRINT N'[PHASE 7] Drift items: '+@Msg;
+GO
+
+-- ═══ PHASE 8: ERROR SUMMARY ═══
+PRINT N'';
+PRINT N'══════════════════════════════════════════════════════════════════';
+PRINT N'[PHASE 8] ERROR SUMMARY';
+PRINT N'══════════════════════════════════════════════════════════════════';
+DECLARE @TotalErrors INT=(SELECT COUNT(*)FROM dbo.DiscoveryErrorLog);
+IF @TotalErrors=0 PRINT N'  All phases completed with zero errors.';
+ELSE BEGIN
+DECLARE @Msg NVARCHAR(MAX) = (SELECT CAST(@TotalErrors AS NVARCHAR(20))+N' | Phases: '+CAST(COUNT(DISTINCT Phase)AS NVARCHAR(10))+N' | Databases: '+CAST((SELECT COUNT(DISTINCT DatabaseName)FROM dbo.DiscoveryErrorLog)AS NVARCHAR(10)) FROM dbo.DiscoveryErrorLog);
+PRINT N'  Total errors: '+@Msg;
+DECLARE @p NVARCHAR(20),@pc INT,@pe NVARCHAR(MAX);
+DECLARE pc CURSOR LOCAL FAST_FORWARD FOR SELECT Phase,COUNT(*),MIN(ErrorMessage)FROM dbo.DiscoveryErrorLog GROUP BY Phase ORDER BY Phase;
+OPEN pc; FETCH NEXT FROM pc INTO @p,@pc,@pe;
+WHILE @@FETCH_STATUS=0 BEGIN
+PRINT N'    '+@p+N': '+CAST(@pc AS NVARCHAR(10))+N' — '+LEFT(ISNULL(@pe,N''),200);
+FETCH NEXT FROM pc INTO @p,@pc,@pe;
+END
+CLOSE pc; DEALLOCATE pc;
+END
+PRINT N'';
+PRINT N'LAYER 1: DISCOVERY ENGINE COMPLETED ' + CONVERT(NVARCHAR(30), GETDATE(), 121);
+GO
