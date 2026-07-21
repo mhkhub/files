@@ -1,0 +1,819 @@
+/* ═══════════════════════════════════════════════════════════════════
+LAYER 3 V10.0 - MIGRATION EXECUTION ENGINE
+Corrected for Layer 1 V7.3 + Layer 2 V10 compatibility
+═══════════════════════════════════════════════════════════════════ */
+PRINT N'LAYER 3 ~ V10.0: INITIALIZING ' + CONVERT(NVARCHAR(30), GETDATE(), 121);
+GO
+IF DB_ID(N'MasterMerge') IS NULL THROW 51010, 'MasterMerge not found. Run Layer 1 first.', 10;
+GO
+USE MasterMerge;
+GO
+SET NOCOUNT ON; SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON;
+GO
+
+/* ═══ RUNTIME INFRASTRUCTURE ═══ */
+IF OBJECT_ID(N'dbo.MigrationConfig', N'U') IS NULL
+CREATE TABLE dbo.MigrationConfig(ConfigKey NVARCHAR(50) PRIMARY KEY, ConfigValue NVARCHAR(255) NOT NULL, Description NVARCHAR(512) NULL, CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+
+MERGE INTO dbo.MigrationConfig AS tgt USING (VALUES 
+    (N'TargetDB', N'dbMerged', N'Target database name'), 
+    (N'BatchSize', N'10000', N'Rows per batch insert'), 
+    (N'EnableLogging', N'1', N'Enable detailed logging'), 
+    (N'EnableCheckpoint', N'1', N'Enable checkpoint recovery'), 
+    (N'MaxRetries', N'3', N'Maximum retries per task'),
+    (N'LargeTableThreshold', N'1000000', N'Row count threshold for batching'),
+    (N'Version', N'V10.0', N'Layer 3 version')) AS src(ConfigKey, ConfigValue, Description) 
+ON tgt.ConfigKey = src.ConfigKey 
+WHEN MATCHED THEN UPDATE SET tgt.ConfigValue = src.ConfigValue, tgt.Description = src.Description 
+WHEN NOT MATCHED THEN INSERT VALUES (src.ConfigKey, src.ConfigValue, src.Description);
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_GetTargetDB() RETURNS SYSNAME AS BEGIN 
+    RETURN (SELECT TOP 1 ConfigValue FROM dbo.MigrationConfig WHERE ConfigKey = N'TargetDB'); 
+END
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_GetTemplateDB() RETURNS SYSNAME AS BEGIN 
+    DECLARE @db SYSNAME; 
+    SELECT TOP 1 @db = DBName FROM dbo.DiscoveryConfig WHERE IsActive = 1 AND DatabaseRole = N'Template' ORDER BY Ord; 
+    IF @db IS NULL SELECT TOP 1 @db = DBName FROM dbo.DiscoveryConfig WHERE IsActive = 1 AND IsTemplate = 1 ORDER BY Ord; 
+    IF @db IS NULL SELECT TOP 1 @db = DBName FROM dbo.DiscoveryConfig WHERE IsActive = 1 ORDER BY Ord; 
+    RETURN @db; 
+END
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_GetMasterSourceDB() RETURNS SYSNAME AS BEGIN 
+    RETURN (SELECT TOP 1 DBName FROM dbo.DiscoveryConfig WHERE IsActive = 1 AND DatabaseRole = N'HO' ORDER BY Ord); 
+END
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_GetConfigInt(@Key NVARCHAR(50)) RETURNS INT AS BEGIN
+    RETURN CAST((SELECT ConfigValue FROM dbo.MigrationConfig WHERE ConfigKey = @Key) AS INT);
+END
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_GetTypeString(@dt NVARCHAR(128), @ml INT, @p TINYINT, @s TINYINT) RETURNS NVARCHAR(256) AS BEGIN 
+    RETURN CASE 
+        WHEN @dt = 'text' THEN 'varchar(max)' 
+        WHEN @dt = 'ntext' THEN 'nvarchar(max)' 
+        WHEN @dt = 'image' THEN 'varbinary(max)' 
+        WHEN @dt IN ('varchar', 'char') THEN @dt + '(' + CASE WHEN @ml = -1 THEN 'MAX' ELSE CAST(@ml AS NVARCHAR(10)) END + ')' 
+        WHEN @dt IN ('nvarchar', 'nchar') THEN @dt + '(' + CASE WHEN @ml = -1 THEN 'MAX' ELSE CAST(@ml / 2 AS NVARCHAR(10)) END + ')' 
+        WHEN @dt IN ('decimal', 'numeric') THEN @dt + '(' + CAST(ISNULL(@p, 18) AS NVARCHAR(10)) + ',' + CAST(ISNULL(@s, 0) AS NVARCHAR(10)) + ')' 
+        WHEN @dt IN ('datetime2', 'datetimeoffset', 'time') THEN @dt + '(' + CAST(ISNULL(@s, 7) AS NVARCHAR(10)) + ')' 
+        WHEN @dt = 'float' AND @p IS NOT NULL AND @p <> 53 THEN 'float(' + CAST(@p AS NVARCHAR(10)) + ')' 
+        ELSE @dt 
+    END; 
+END
+GO
+
+/* ═══ ERROR CLASSIFICATION ═══ */
+IF OBJECT_ID('dbo.ErrorClassification', 'U') IS NOT NULL DROP TABLE dbo.ErrorClassification;
+CREATE TABLE dbo.ErrorClassification(ErrorNumber INT PRIMARY KEY, Category NVARCHAR(20) NOT NULL, ShouldRetry BIT NOT NULL DEFAULT 0, MaxRetries INT NOT NULL DEFAULT 0);
+
+INSERT dbo.ErrorClassification(ErrorNumber, Category, ShouldRetry, MaxRetries) VALUES 
+    (1205, 'DEADLOCK', 1, 3), (1222, 'DEADLOCK', 1, 3), 
+    (-2, 'TIMEOUT', 1, 3), (2, 'TIMEOUT', 1, 3), (53, 'TIMEOUT', 1, 3), (701, 'TIMEOUT', 1, 3), (8645, 'TIMEOUT', 1, 3), 
+    (2627, 'DUPLICATE', 0, 0), (2601, 'DUPLICATE', 0, 0), 
+    (208, 'MISSING_OBJECT', 0, 0), (207, 'MISSING_OBJECT', 0, 0), (4104, 'MISSING_OBJECT', 0, 0), (4121, 'MISSING_OBJECT', 0, 0), 
+    (102, 'SYNTAX', 0, 0), (103, 'SYNTAX', 0, 0), (105, 'SYNTAX', 0, 0), (156, 'SYNTAX', 0, 0), (170, 'SYNTAX', 0, 0), 
+    (229, 'PERMISSION', 0, 0), (230, 'PERMISSION', 0, 0), (300, 'PERMISSION', 0, 0), (3704, 'PERMISSION', 0, 0), 
+    (206, 'TYPE_ERROR', 0, 0), (241, 'TYPE_ERROR', 0, 0), (242, 'TYPE_ERROR', 0, 0), (245, 'TYPE_ERROR', 0, 0), 
+    (8114, 'TYPE_ERROR', 0, 0), (8115, 'TYPE_ERROR', 0, 0);
+
+CREATE OR ALTER FUNCTION dbo.fn_GetErrorCategory(@e INT) RETURNS NVARCHAR(20) AS BEGIN 
+    RETURN ISNULL((SELECT Category FROM dbo.ErrorClassification WHERE ErrorNumber = @e), 'OTHER'); 
+END
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_ShouldRetry(@e INT) RETURNS BIT AS BEGIN 
+    RETURN ISNULL((SELECT ShouldRetry FROM dbo.ErrorClassification WHERE ErrorNumber = @e), 0); 
+END
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_GetMaxRetries(@e INT) RETURNS INT AS BEGIN 
+    RETURN ISNULL((SELECT MaxRetries FROM dbo.ErrorClassification WHERE ErrorNumber = @e), 0); 
+END
+GO
+
+/* ═══ RUNTIME TABLES ═══ */
+DECLARE @dfk NVARCHAR(MAX) = N'';
+SELECT @dfk += N'ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id)) + '.' + QUOTENAME(OBJECT_NAME(parent_object_id)) + ' DROP CONSTRAINT ' + QUOTENAME(name) + ';' 
+FROM sys.foreign_keys WHERE referenced_object_id IN (OBJECT_ID(N'dbo.MigrationTasks'), OBJECT_ID(N'dbo.TaskExecution'), OBJECT_ID(N'dbo.ExecutionLog'), OBJECT_ID(N'dbo.IDTranslationMap'), OBJECT_ID(N'dbo.MigrationCheckpoint'), OBJECT_ID(N'dbo.MigrationRun'), OBJECT_ID(N'dbo.ValidationResults'), OBJECT_ID(N'dbo.TaskDependency'));
+IF @dfk <> N'' EXEC(@dfk);
+
+DROP TABLE IF EXISTS dbo.MigrationTasks, dbo.TaskExecution, dbo.ExecutionLog, dbo.IDTranslationMap, dbo.MigrationCheckpoint, dbo.MigrationRun, dbo.ValidationResults, dbo.TaskDependency;
+
+CREATE TABLE dbo.MigrationRun(
+    RunId UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(), 
+    TargetDB SYSNAME NOT NULL, 
+    TemplateDB SYSNAME NOT NULL, 
+    MasterSourceDB SYSNAME NULL, 
+    StartTime DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(), 
+    EndTime DATETIME2 NULL, 
+    Status NVARCHAR(30) NOT NULL DEFAULT N'RUNNING', 
+    TotalTasks INT NULL, 
+    CompletedTasks INT NULL, 
+    FailedTasks INT NULL, 
+    SkippedTasks INT NULL, 
+    BlockedTasks INT NULL,
+    TotalRows BIGINT NULL,
+    CONSTRAINT CHK_MR_Status CHECK (Status IN ('RUNNING', 'SUCCESS', 'PARTIAL', 'COMPLETED_WITH_ERRORS', 'FAILED'))
+);
+
+CREATE TABLE dbo.MigrationTasks(
+    TaskId BIGINT IDENTITY(1,1) PRIMARY KEY, 
+    RunId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.MigrationRun(RunId), 
+    PhaseId INT NOT NULL, 
+    PhaseName NVARCHAR(50) NOT NULL, 
+    SchemaName SYSNAME NOT NULL, 
+    TableName SYSNAME NOT NULL, 
+    SourceDB SYSNAME NULL, 
+    SourceOrd INT NULL, 
+    ExecutionOrder INT NOT NULL, 
+    TaskType NVARCHAR(32) NOT NULL, 
+    TaskSQL NVARCHAR(MAX) NOT NULL, 
+    RequiresIdentityInsert BIT NOT NULL DEFAULT 0, 
+    Status NVARCHAR(20) NOT NULL DEFAULT N'PENDING', 
+    RetryCount INT NOT NULL DEFAULT 0, 
+    LastErrorNumber INT NULL, 
+    LastErrorType NVARCHAR(20) NULL, 
+    RowsAffected BIGINT NULL, 
+    ErrorMessage NVARCHAR(MAX) NULL, 
+    StartedAt DATETIME2 NULL, 
+    CompletedAt DATETIME2 NULL,
+    BatchNumber INT NULL,
+    TotalBatches INT NULL,
+    CONSTRAINT CHK_TS_Status CHECK (Status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'CANCELLED', 'BLOCKED'))
+);
+
+CREATE INDEX IX_Tasks_Run ON dbo.MigrationTasks(RunId, ExecutionOrder, TaskId); 
+CREATE INDEX IX_Tasks_Status ON dbo.MigrationTasks(RunId, Status);
+CREATE INDEX IX_Tasks_Phase ON dbo.MigrationTasks(RunId, PhaseId);
+
+CREATE TABLE dbo.TaskDependency(
+    TaskId BIGINT NOT NULL REFERENCES dbo.MigrationTasks(TaskId), 
+    DependsOnTaskId BIGINT NOT NULL REFERENCES dbo.MigrationTasks(TaskId), 
+    PRIMARY KEY (TaskId, DependsOnTaskId)
+);
+
+CREATE TABLE dbo.TaskExecution(
+    ExecutionId BIGINT IDENTITY(1,1) PRIMARY KEY, 
+    TaskId BIGINT NOT NULL REFERENCES dbo.MigrationTasks(TaskId), 
+    RunId UNIQUEIDENTIFIER NOT NULL, 
+    StartTime DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(), 
+    EndTime DATETIME2 NULL, 
+    ElapsedMs INT NULL, 
+    RowsWritten BIGINT NULL, 
+    Status NVARCHAR(20) NOT NULL, 
+    ErrorMessage NVARCHAR(MAX) NULL
+);
+
+CREATE TABLE dbo.ExecutionLog(
+    LogId BIGINT IDENTITY(1,1) PRIMARY KEY, 
+    RunId UNIQUEIDENTIFIER NOT NULL, 
+    TaskId BIGINT NULL, 
+    LogLevel NVARCHAR(20) NOT NULL, 
+    Message NVARCHAR(MAX) NOT NULL, 
+    LoggedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+); 
+
+CREATE INDEX IX_Log_Run ON dbo.ExecutionLog(RunId, LoggedAt);
+
+CREATE TABLE dbo.IDTranslationMap(
+    MapId BIGINT IDENTITY(1,1) PRIMARY KEY, 
+    TableName SYSNAME NOT NULL, 
+    SourceOrd INT NOT NULL, 
+    OldPK NVARCHAR(512) NOT NULL, 
+    NewPK NVARCHAR(512) NOT NULL, 
+    TranslationType NVARCHAR(32) NOT NULL, 
+    SourceDB SYSNAME NULL, 
+    CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+); 
+
+CREATE INDEX IX_IDTrans_Lookup ON dbo.IDTranslationMap(TableName, SourceOrd, OldPK); 
+CREATE INDEX IX_IDTrans_New ON dbo.IDTranslationMap(TableName, NewPK);
+
+CREATE TABLE dbo.MigrationCheckpoint(
+    RunId UNIQUEIDENTIFIER PRIMARY KEY REFERENCES dbo.MigrationRun(RunId), 
+    LastCompletedTaskId BIGINT NULL, 
+    LastPhaseId INT NULL, 
+    UpdatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+CREATE TABLE dbo.ValidationResults(
+    ValidationId BIGINT IDENTITY(1,1) PRIMARY KEY, 
+    RunId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.MigrationRun(RunId), 
+    SchemaName SYSNAME NOT NULL, 
+    TableName SYSNAME NOT NULL, 
+    ValidationType NVARCHAR(32) NOT NULL, 
+    ExpectedCount BIGINT NULL, 
+    ActualCount BIGINT NULL, 
+    Difference BIGINT NULL, 
+    Status NVARCHAR(20) NOT NULL, 
+    Details NVARCHAR(MAX) NULL, 
+    ValidatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+GO
+
+/* ═══ LOGGING ═══ */
+CREATE OR ALTER PROCEDURE dbo.usp_Log @R UNIQUEIDENTIFIER, @T BIGINT = NULL, @L NVARCHAR(20), @M NVARCHAR(MAX) AS BEGIN 
+    SET NOCOUNT ON; 
+    INSERT dbo.ExecutionLog(RunId, TaskId, LogLevel, Message) VALUES (@R, @T, @L, @M); 
+    IF @L IN ('WARNING', 'ERROR') PRINT N'[' + CONVERT(NVARCHAR(19), SYSUTCDATETIME(), 120) + N'][' + @L + N'] ' + LEFT(@M, 4000); 
+    ELSE IF @L = 'INFO' PRINT N'  ' + LEFT(@M, 4000); 
+END
+GO
+
+/* ═══ SQL RENDERERS (PURE EXECUTION, NO PLANNING) ═══ */
+CREATE OR ALTER FUNCTION dbo.fn_RenderInsertSQL(
+    @TgtDB SYSNAME, @Sch SYSNAME, @Tbl SYSNAME, 
+    @Cols NVARCHAR(MAX), @SrcCols NVARCHAR(MAX), 
+    @SrcDB SYSNAME, @SrcSch SYSNAME, @SrcTbl SYSNAME, 
+    @MergePredicate NVARCHAR(MAX), @HasIdentity BIT, 
+    @NeedsSourceOrd BIT, @SourceOrd INT, @IsRekey BIT
+) RETURNS NVARCHAR(MAX) AS BEGIN 
+    DECLARE @Q NVARCHAR(256) = QUOTENAME(@TgtDB); 
+    DECLARE @SQL NVARCHAR(MAX); 
+    
+    SET @SQL = N'DECLARE @__HasIdentity BIT = ' + CAST(@HasIdentity AS NVARCHAR(1)) + N';' + CHAR(10) 
+        + N'BEGIN TRY' + CHAR(10) 
+        + N'  IF @__HasIdentity = 1 SET IDENTITY_INSERT ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' ON;' + CHAR(10) 
+        + N'  INSERT INTO ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' (' + @Cols 
+        + CASE WHEN @NeedsSourceOrd = 1 THEN N', [__SourceOrd]' ELSE N'' END + N')' + CHAR(10) 
+        + N'  SELECT ' + @SrcCols + CHAR(10) 
+        + N'  FROM ' + QUOTENAME(@SrcDB) + N'.' + QUOTENAME(@SrcSch) + N'.' + QUOTENAME(@SrcTbl) + N' src'; 
+    
+    IF @MergePredicate IS NOT NULL AND @MergePredicate <> N'' AND NOT @IsRekey 
+        SET @SQL = @SQL + CHAR(10) + N'  WHERE NOT EXISTS (SELECT 1 FROM ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' tgt WHERE ' + @MergePredicate + N')'; 
+    
+    SET @SQL = @SQL + N';' + CHAR(10) 
+        + N'  IF @__HasIdentity = 1 SET IDENTITY_INSERT ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' OFF;' + CHAR(10) 
+        + N'END TRY BEGIN CATCH' + CHAR(10) 
+        + N'  IF @__HasIdentity = 1 BEGIN TRY SET IDENTITY_INSERT ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' OFF; END TRY BEGIN CATCH END CATCH;' + CHAR(10) 
+        + N'  THROW;' + CHAR(10) 
+        + N'END CATCH;'; 
+    
+    RETURN @SQL; 
+END
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_RenderTranslationSQL(
+    @TgtDB SYSNAME, @HODB SYSNAME, @Sch SYSNAME, @Tbl SYSNAME, 
+    @PKCol SYSNAME, @TransType NVARCHAR(32), @LookupKey NVARCHAR(256)
+) RETURNS NVARCHAR(MAX) AS BEGIN 
+    DECLARE @Q NVARCHAR(256) = QUOTENAME(@TgtDB); 
+    DECLARE @SQL NVARCHAR(MAX); 
+    
+    IF @TransType = 'REKEY' 
+        SET @SQL = N'INSERT INTO dbo.IDTranslationMap (TableName, SourceOrd, OldPK, NewPK, TranslationType, SourceDB)' + CHAR(10) 
+            + N'SELECT N''' + @Tbl + N''', 0, ' + CHAR(10) 
+            + N'  CONVERT(NVARCHAR(512), src.' + QUOTENAME(@PKCol) + N'),' + CHAR(10) 
+            + N'  CONVERT(NVARCHAR(512), CONVERT(BIGINT, src.' + QUOTENAME(@PKCol) + N') + ' + CAST(1000000000 AS NVARCHAR(20)) + N'),' + CHAR(10) 
+            + N'  ''REKEY'', N''' + @Tbl + N'''' + CHAR(10) 
+            + N'FROM ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' src' + CHAR(10) 
+            + N'WHERE NOT EXISTS (SELECT 1 FROM dbo.IDTranslationMap tm WHERE tm.TableName=N''' + @Tbl + N''' AND tm.OldPK=CONVERT(NVARCHAR(512), src.' + QUOTENAME(@PKCol) + N'));'; 
+    
+    ELSE IF @TransType = 'MERGE_TO_MASTER' 
+        SET @SQL = N'INSERT INTO dbo.IDTranslationMap (TableName, SourceOrd, OldPK, NewPK, TranslationType, SourceDB)' + CHAR(10) 
+            + N'SELECT N''' + @Tbl + N''', 0, ' + CHAR(10) 
+            + N'  CONVERT(NVARCHAR(512), src.' + QUOTENAME(@PKCol) + N'),' + CHAR(10) 
+            + N'  CONVERT(NVARCHAR(512), ho.' + QUOTENAME(@PKCol) + N'),' + CHAR(10) 
+            + N'  ''MERGE_TO_MASTER'', N''' + @Tbl + N'''' + CHAR(10) 
+            + N'FROM ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' src' + CHAR(10) 
+            + N'JOIN ' + QUOTENAME(@HODB) + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' ho ON ho.' + QUOTENAME(@LookupKey) + N' = src.' + QUOTENAME(@LookupKey) + CHAR(10) 
+            + N'WHERE NOT EXISTS (SELECT 1 FROM dbo.IDTranslationMap tm WHERE tm.TableName=N''' + @Tbl + N''' AND tm.OldPK=CONVERT(NVARCHAR(512), src.' + QUOTENAME(@PKCol) + N'));'; 
+    
+    ELSE 
+        SET @SQL = N'-- Translation type ' + @TransType + N' not implemented'; 
+    
+    RETURN @SQL; 
+END
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_RenderFKRewriteSQL(
+    @TgtDB SYSNAME, @Sch SYSNAME, @Tbl SYSNAME, 
+    @FKCol SYSNAME, @RefCol SYSNAME, @ColType NVARCHAR(128)
+) RETURNS NVARCHAR(MAX) AS BEGIN 
+    DECLARE @Q NVARCHAR(256) = QUOTENAME(@TgtDB); 
+    
+    RETURN N'UPDATE tgt SET ' + QUOTENAME(@FKCol) + N' = CASE WHEN tm.NewPK IS NOT NULL THEN CONVERT(' + @ColType + N', tm.NewPK) ELSE tgt.' + QUOTENAME(@FKCol) + N' END' + CHAR(10) 
+        + N'FROM ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' tgt' + CHAR(10) 
+        + N'LEFT JOIN dbo.IDTranslationMap tm ON tm.TableName = N''' + @Tbl + N''' AND tm.OldPK = CONVERT(NVARCHAR(512), tgt.' + QUOTENAME(@FKCol) + N')' + CHAR(10) 
+        + N'WHERE tm.NewPK IS NOT NULL;'; 
+END
+GO
+
+CREATE OR ALTER FUNCTION dbo.fn_BuildMigrationSQLFromManifest(
+    @TgtDB SYSNAME, @Sch SYSNAME, @Tbl SYSNAME, @Method NVARCHAR(32), 
+    @MergePredicate NVARCHAR(MAX), @HasIdentity BIT, @NeedsSourceOrd BIT, 
+    @IsRekey BIT, @SrcDB SYSNAME, @SrcSch SYSNAME, @SrcTbl SYSNAME, 
+    @SrcOrd INT, @SrcRole NVARCHAR(16)
+) RETURNS NVARCHAR(MAX) AS BEGIN 
+    DECLARE @Q NVARCHAR(256) = QUOTENAME(@TgtDB); 
+    DECLARE @SQL NVARCHAR(MAX); 
+    DECLARE @Cols NVARCHAR(MAX); 
+    DECLARE @SrcCols NVARCHAR(MAX); 
+    DECLARE @Tpl SYSNAME = dbo.fn_GetTemplateDB(); 
+    
+    SELECT @Cols = STUFF((
+        SELECT N', ' + QUOTENAME(tc.ColumnName) 
+        FROM dbo.TableColumns tc 
+        WHERE tc.DatabaseName = @Tpl AND tc.SchemaName = @Sch AND tc.TableName = @Tbl 
+            AND ISNULL(tc.IsComputed, 0) = 0 AND ISNULL(tc.IsRowVersion, 0) = 0 
+            AND EXISTS (SELECT 1 FROM dbo.TableColumns sc WHERE sc.DatabaseName = @SrcDB AND sc.SchemaName = @SrcSch AND sc.TableName = @SrcTbl AND sc.ColumnName = tc.ColumnName) 
+        ORDER BY tc.OrdinalPosition 
+        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, ''); 
+    
+    IF @IsRekey = 1 AND @SrcRole <> 'HO' 
+    BEGIN 
+        SELECT @SrcCols = STUFF((
+            SELECT N', ' + CASE 
+                WHEN pk.Ordinal = 1 THEN N'CONVERT(BIGINT, CONVERT(DECIMAL(38,0), src.' + QUOTENAME(tc.ColumnName) + N') + 1000000000)' 
+                ELSE N'src.' + QUOTENAME(tc.ColumnName) 
+            END 
+            FROM dbo.TableColumns tc 
+            LEFT JOIN dbo.TablePKColumns pk ON pk.DatabaseName = @Tpl AND pk.SchemaName = tc.SchemaName AND pk.TableName = tc.TableName AND pk.ColumnName = tc.ColumnName AND pk.Ordinal = 1 
+            WHERE tc.DatabaseName = @Tpl AND tc.SchemaName = @Sch AND tc.TableName = @Tbl 
+                AND ISNULL(tc.IsComputed, 0) = 0 AND ISNULL(tc.IsRowVersion, 0) = 0 
+                AND EXISTS (SELECT 1 FROM dbo.TableColumns sc WHERE sc.DatabaseName = @SrcDB AND sc.SchemaName = @SrcSch AND sc.TableName = @SrcTbl AND sc.ColumnName = tc.ColumnName) 
+            ORDER BY tc.OrdinalPosition 
+            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, ''); 
+    END 
+    ELSE 
+        SET @SrcCols = @Cols; 
+    
+    IF @NeedsSourceOrd = 1 
+        SET @SrcCols = @SrcCols + N', ' + CAST(@SrcOrd AS NVARCHAR(20)) + N' AS [__SourceOrd]'; 
+    
+    RETURN dbo.fn_RenderInsertSQL(@TgtDB, @Sch, @Tbl, @Cols, @SrcCols, @SrcDB, @SrcSch, @SrcTbl, @MergePredicate, @HasIdentity, @NeedsSourceOrd, @SrcOrd, @IsRekey); 
+END
+GO
+
+/* ═══ TASK COMPILER ═══ */
+CREATE OR ALTER PROCEDURE dbo.usp_CompileTasks @RunId UNIQUEIDENTIFIER AS BEGIN 
+    SET NOCOUNT ON; 
+    
+    DECLARE @Tgt SYSNAME = dbo.fn_GetTargetDB(); 
+    DECLARE @Tpl SYSNAME = dbo.fn_GetTemplateDB(); 
+    DECLARE @HO SYSNAME = dbo.fn_GetMasterSourceDB(); 
+    DECLARE @Q NVARCHAR(256) = QUOTENAME(@Tgt); 
+    DECLARE @Sort INT = 0; 
+    DECLARE @Msg NVARCHAR(MAX); 
+    
+    IF @Tgt IS NULL THROW 51022, 'TargetDB missing.', 10; 
+    IF @Tpl IS NULL THROW 51023, 'Template DB not resolved.', 10; 
+    IF NOT EXISTS (SELECT 1 FROM dbo.ExecutionManifest WHERE Status = 'Active') 
+        THROW 51024, 'ExecutionManifest has no active entries. Run Layer 2 first.', 10; 
+    
+    SET @Msg = '[COMPILE] Target=' + @Tgt + ' Template=' + @Tpl + ' HO=' + ISNULL(@HO, '<none>'); 
+    EXEC dbo.usp_Log @RunId, NULL, 'INFO', @Msg;
+
+    /* PHASE 0: BOOTSTRAP */
+    SET @Sort += 1; 
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    VALUES (@RunId, 0, 'BOOTSTRAP', 'dbo', 'DropDB', @Sort, 'DDL', 
+        'IF DB_ID(N''' + @Tgt + ''') IS NOT NULL BEGIN ALTER DATABASE ' + @Q + ' SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE ' + @Q + '; END');
+    
+    SET @Sort += 1; 
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    VALUES (@RunId, 0, 'BOOTSTRAP', 'dbo', 'CreateDB', @Sort, 'DDL', 'CREATE DATABASE ' + @Q + ';');
+    
+    SET @Sort += 1; 
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    VALUES (@RunId, 0, 'BOOTSTRAP', 'dbo', 'Recovery', @Sort, 'DDL', 'ALTER DATABASE ' + @Q + ' SET RECOVERY SIMPLE;');
+    
+    SET @Sort += 1; 
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    VALUES (@RunId, 0, 'BOOTSTRAP', 'dbo', 'VerifyDB', @Sort, 'DDL', 
+        'IF DB_ID(N''' + REPLACE(@Tgt, '''', '''''') + ''') IS NULL THROW 51099, ''Bootstrap failed: target database does not exist after CreateDB.'', 1;');
+
+    /* PHASE 1: SCHEMAS */
+    DECLARE @s SYSNAME; 
+    DECLARE sc CURSOR LOCAL FAST_FORWARD FOR SELECT DISTINCT SchemaName FROM dbo.ExecutionManifest WHERE Status = 'Active'; 
+    OPEN sc; 
+    FETCH NEXT FROM sc INTO @s; 
+    WHILE @@FETCH_STATUS = 0 
+    BEGIN 
+        SET @Sort += 1; 
+        INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+        VALUES (@RunId, 1, 'CREATE_SCHEMA', @s, '', @Sort, 'DDL', 
+            'IF NOT EXISTS(SELECT 1 FROM ' + @Q + '.sys.schemas WHERE name=N''' + REPLACE(@s, '''', '''''') + ''') EXEC ' + @Q + '.sys.sp_executesql N''CREATE SCHEMA ' + REPLACE(QUOTENAME(@s), '''', '''''') + ''';'); 
+        FETCH NEXT FROM sc INTO @s; 
+    END 
+    CLOSE sc; 
+    DEALLOCATE sc;
+
+    /* PHASE 2: TABLES */
+    IF OBJECT_ID('tempdb..#TableDDL') IS NOT NULL DROP TABLE #TableDDL; 
+    SELECT em.SchemaName, em.TableName, em.ExecutionPhaseId, em.ExecutionOrder, 
+        tc.ColumnName, tc.OrdinalPosition, 
+        dbo.fn_GetTypeString(tc.DataType, tc.MaxLength, tc.Precision, tc.Scale) AS TypeStr, 
+        ISNULL(tc.IsNullable, 0) AS IsNullable, 
+        ISNULL(tc.IsIdentity, 0) AS IsIdentity, 
+        CASE WHEN em.UniquenessStrategy = 'ExpandPK' AND tc.ColumnName = 'BranchId' THEN 1 ELSE 0 END AS IsBranchId 
+    INTO #TableDDL 
+    FROM dbo.ExecutionManifest em 
+    JOIN dbo.TableColumns tc ON tc.DatabaseName = @Tpl AND tc.SchemaName = em.SchemaName AND tc.TableName = em.TableName 
+    WHERE em.Status = 'Active' AND ISNULL(tc.IsComputed, 0) = 0 AND ISNULL(tc.IsRowVersion, 0) = 0;
+    
+    DECLARE @sch SYSNAME, @tbl SYSNAME, @sql NVARCHAR(MAX); 
+    DECLARE tbl_cur CURSOR LOCAL FAST_FORWARD FOR SELECT DISTINCT SchemaName, TableName FROM #TableDDL ORDER BY SchemaName, TableName; 
+    OPEN tbl_cur; 
+    FETCH NEXT FROM tbl_cur INTO @sch, @tbl; 
+    WHILE @@FETCH_STATUS = 0 
+    BEGIN 
+        SET @Sort += 1; 
+        SET @sql = N'IF OBJECT_ID(N''' + @Tgt + '.' + @sch + '.' + @tbl + ''', ''U'') IS NULL BEGIN CREATE TABLE ' + @Q + '.' + QUOTENAME(@sch) + '.' + QUOTENAME(@tbl) + '(' + CHAR(10); 
+        
+        SELECT @sql = @sql + N'  ' + QUOTENAME(ColumnName) + ' ' + TypeStr 
+            + CASE WHEN IsIdentity = 1 THEN N' IDENTITY(1,1)' ELSE N'' END 
+            + CASE WHEN IsNullable = 1 THEN N' NULL' ELSE N' NOT NULL' END 
+            + N',' + CHAR(10) 
+        FROM #TableDDL 
+        WHERE SchemaName = @sch AND TableName = @tbl 
+        ORDER BY OrdinalPosition; 
+        
+        SET @sql = LEFT(@sql, LEN(@sql) - 2) + CHAR(10) + N') END'; 
+        
+        INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+        VALUES (@RunId, 2, 'CREATE_TABLE', @sch, @tbl, @Sort, 'DDL', @sql); 
+        
+        FETCH NEXT FROM tbl_cur INTO @sch, @tbl; 
+    END 
+    CLOSE tbl_cur; 
+    DEALLOCATE tbl_cur; 
+    DROP TABLE #TableDDL;
+
+    /* PHASE 3: SCHEMA COMPLETION */
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    SELECT @RunId, 3, 'ADD_SOURCEORD', em.SchemaName, em.TableName, @Sort + ROW_NUMBER() OVER (ORDER BY em.SchemaName, em.TableName), 'DDL', 
+        'IF COL_LENGTH(N''' + @Tgt + '.' + em.SchemaName + '.' + em.TableName + ''', ''__SourceOrd'') IS NULL ALTER TABLE ' + @Q + '.' + QUOTENAME(em.SchemaName) + '.' + QUOTENAME(em.TableName) + ' ADD [__SourceOrd] INT NOT NULL DEFAULT 0;' 
+    FROM dbo.ExecutionManifest em 
+    WHERE em.Status = 'Active' AND em.TranslationCount > 0;
+    
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    SELECT @RunId, 3, 'ADD_BRANCHID', em.SchemaName, em.TableName, @Sort + 10000 + ROW_NUMBER() OVER (ORDER BY em.SchemaName, em.TableName), 'DDL', 
+        'IF COL_LENGTH(N''' + @Tgt + '.' + em.SchemaName + '.' + em.TableName + ''', ''BranchId'') IS NULL ALTER TABLE ' + @Q + '.' + QUOTENAME(em.SchemaName) + '.' + QUOTENAME(em.TableName) + ' ADD [BranchId] INT NOT NULL DEFAULT 0;' 
+    FROM dbo.ExecutionManifest em 
+    WHERE em.Status = 'Active' AND em.UniquenessStrategy = 'ExpandPK';
+
+    /* PHASE 4: DATA MIGRATION */
+    IF OBJECT_ID('tempdb..#ColInfo') IS NOT NULL DROP TABLE #ColInfo; 
+    SELECT em.SchemaName, em.TableName, em.MigrationMethod, em.MergePredicate, em.HasIdentity, em.NeedsSourceOrd, 
+        em.IsRekey, tc.ColumnName, tc.OrdinalPosition, ISNULL(tc.IsIdentity, 0) AS IsIdentity 
+    INTO #ColInfo 
+    FROM dbo.ExecutionManifest em 
+    JOIN dbo.TableColumns tc ON tc.DatabaseName = @Tpl AND tc.SchemaName = em.SchemaName AND tc.TableName = em.TableName 
+    WHERE em.Status = 'Active' AND ISNULL(tc.IsComputed, 0) = 0 AND ISNULL(tc.IsRowVersion, 0) = 0;
+    
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, SourceDB, SourceOrd, ExecutionOrder, TaskType, TaskSQL, RequiresIdentityInsert) 
+    SELECT @RunId, 
+        CASE WHEN msp.SourceRole = 'HO' THEN 4 ELSE 5 END, 
+        CASE WHEN msp.SourceRole = 'HO' THEN 'HO_MIGRATION' ELSE 'REGION_MIGRATION' END, 
+        em.SchemaName, em.TableName, msp.SourceDB, msp.SourceOrd, em.ExecutionOrder + msp.SourceOrd, 
+        CASE WHEN msp.SourceRole = 'HO' THEN 'HO' ELSE 'REGION' END, 
+        dbo.fn_BuildMigrationSQLFromManifest(@Tgt, em.SchemaName, em.TableName, em.MigrationMethod, em.MergePredicate, em.HasIdentity, em.NeedsSourceOrd, em.IsRekey, msp.SourceDB, msp.SourceSch, msp.SourceTbl, msp.SourceOrd, msp.SourceRole), 
+        em.HasIdentity 
+    FROM dbo.ExecutionManifest em 
+    JOIN dbo.MigrationSourcePlan msp ON msp.ContractId = em.ContractId 
+    WHERE em.Status = 'Active' AND msp.Status = 'PENDING';
+
+    /* PHASE 5: TRANSLATION MAP */
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    SELECT @RunId, 5, 'BUILD_TRANSLATION', tp.SchemaName, tp.TableName, @Sort + 20000 + ROW_NUMBER() OVER (ORDER BY tp.SchemaName, tp.TableName), 'TRANSLATION', 
+        dbo.fn_RenderTranslationSQL(@Tgt, @HO, tp.SchemaName, tp.TableName, tp.ColumnName, tp.TranslationType, tp.LookupKey) 
+    FROM dbo.TranslationPlan tp 
+    JOIN dbo.ExecutionManifest em ON em.SchemaName = tp.SchemaName AND em.TableName = tp.TableName 
+    WHERE em.Status = 'Active' AND tp.TranslationType IS NOT NULL;
+
+    /* PHASE 6: FK DATA REWRITE */
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    SELECT @RunId, 6, 'FK_DATA_REWRITE', frp.ChildSchema, frp.ChildTable, @Sort + 30000 + ROW_NUMBER() OVER (ORDER BY frp.ChildSchema, frp.ChildTable), 'FK_REWRITE', 
+        dbo.fn_RenderFKRewriteSQL(@Tgt, frp.ChildSchema, frp.ChildTable, frp.ChildColumn, frp.ReferencedColumn, frp.ColumnType) 
+    FROM dbo.FKRewritePlan frp 
+    JOIN dbo.ExecutionManifest em ON em.SchemaName = frp.ChildSchema AND em.TableName = frp.ChildTable 
+    WHERE em.Status = 'Active';
+
+    /* PHASE 7: CONSTRAINTS */
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    SELECT @RunId, 7, 'ADD_PK', pk.SchemaName, pk.TableName, @Sort + 40000 + ROW_NUMBER() OVER (ORDER BY pk.SchemaName, pk.TableName), 'CONSTRAINT', 
+        'IF NOT EXISTS(SELECT 1 FROM ' + @Q + '.sys.key_constraints WHERE name=''PK_' + pk.SchemaName + '_' + pk.TableName + ''') ALTER TABLE ' + @Q + '.' + QUOTENAME(pk.SchemaName) + '.' + QUOTENAME(pk.TableName) + ' ADD CONSTRAINT PK_' + pk.SchemaName + '_' + pk.TableName + ' PRIMARY KEY CLUSTERED(' + STUFF((SELECT ', ' + QUOTENAME(pk2.ColumnName) FROM dbo.TablePKColumns pk2 WHERE pk2.DatabaseName = @Tpl AND pk2.SchemaName = pk.SchemaName AND pk2.TableName = pk.TableName ORDER BY pk2.Ordinal FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') + ');' 
+    FROM dbo.TablePKColumns pk 
+    WHERE pk.DatabaseName = @Tpl AND EXISTS (SELECT 1 FROM dbo.ExecutionManifest em WHERE em.SchemaName = pk.SchemaName AND em.TableName = pk.TableName AND em.Status = 'Active') 
+    GROUP BY pk.SchemaName, pk.TableName;
+    
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    SELECT @RunId, 7, 'ADD_FK', fk.SchemaName, fk.TableName, @Sort + 50000 + ROW_NUMBER() OVER (ORDER BY fk.SchemaName, fk.TableName, fk.FKName), 'CONSTRAINT', 
+        'IF NOT EXISTS(SELECT 1 FROM ' + @Q + '.sys.foreign_keys WHERE name=''' + fk.FKName + ''') ALTER TABLE ' + @Q + '.' + QUOTENAME(fk.SchemaName) + '.' + QUOTENAME(fk.TableName) + ' WITH NOCHECK ADD CONSTRAINT ' + QUOTENAME(fk.FKName) + ' FOREIGN KEY(' + REPLACE(REPLACE(fk.FKColumns, '[', ''), ']', '') + ') REFERENCES ' + @Q + '.' + QUOTENAME(fk.ReferencedSchema) + '.' + QUOTENAME(fk.ReferencedTable) + '(' + REPLACE(REPLACE(fk.ReferencedColumns, '[', ''), ']', '') + ');' 
+    FROM dbo.TableFKDetails fk 
+    JOIN dbo.ExecutionManifest em_c ON em_c.SchemaName = fk.SchemaName AND em_c.TableName = fk.TableName 
+    JOIN dbo.ExecutionManifest em_p ON em_p.SchemaName = fk.ReferencedSchema AND em_p.TableName = fk.ReferencedTable 
+    WHERE fk.DatabaseName = @Tpl AND em_c.Status = 'Active' AND em_p.Status = 'Active';
+
+    /* PHASE 8: IDENTITY RESEED */
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    SELECT @RunId, 8, 'IDENTITY_RESEED', tc.SchemaName, tc.TableName, @Sort + 60000 + ROW_NUMBER() OVER (ORDER BY tc.SchemaName, tc.TableName), 'IDENTITY', 
+        'DECLARE @m BIGINT; SELECT @m=ISNULL(MAX(' + QUOTENAME(tc.ColumnName) + '),0) FROM ' + @Q + '.' + QUOTENAME(tc.SchemaName) + '.' + QUOTENAME(tc.TableName) + '; IF @m>0 DBCC CHECKIDENT(N''' + @Tgt + '.' + tc.SchemaName + '.' + tc.TableName + ''', RESEED, @m);' 
+    FROM dbo.TableColumns tc 
+    WHERE tc.DatabaseName = @Tpl AND tc.IsIdentity = 1 AND EXISTS (SELECT 1 FROM dbo.ExecutionManifest em WHERE em.SchemaName = tc.SchemaName AND em.TableName = tc.TableName AND em.Status = 'Active');
+
+    /* PHASE 9: VALIDATION (SIMPLIFIED - Layer 2 only creates stubs) */
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    SELECT @RunId, 9, 'VALIDATION', vp.SchemaName, vp.TableName, @Sort + 70000 + ROW_NUMBER() OVER (ORDER BY vp.SchemaName, vp.TableName), 'VALIDATION', 
+        N'DECLARE @src BIGINT, @tgt BIGINT;' + CHAR(10) 
+        + N'SELECT @src=COUNT_BIG(*) FROM ' + QUOTENAME(@Tpl) + N'.' + QUOTENAME(vp.SchemaName) + N'.' + QUOTENAME(vp.TableName) + N';' + CHAR(10) 
+        + N'SELECT @tgt=COUNT_BIG(*) FROM ' + @Q + N'.' + QUOTENAME(vp.SchemaName) + N'.' + QUOTENAME(vp.TableName) + N';' + CHAR(10) 
+        + N'INSERT dbo.ValidationResults(RunId,SchemaName,TableName,ValidationType,ExpectedCount,ActualCount,Difference,Status,Details) VALUES(''' + CAST(@RunId AS NVARCHAR(40)) + N''',N''' + REPLACE(vp.SchemaName, '''', '''''') + N''',N''' + REPLACE(vp.TableName, '''', '''''') + N''',N''' + vp.ValidationType + N''',@src,@tgt,@tgt-@src,CASE WHEN @src=@tgt THEN N''MATCH'' ELSE N''FAILED'' END,N''' + ISNULL(REPLACE(vp.ExpectedResult, '''', ''''''), N'') + N''');' + CHAR(10) 
+        + N'IF @src<>@tgt THROW 51040,''Validation failed: row count mismatch.'',1;' 
+    FROM dbo.ValidationPlan vp 
+    WHERE EXISTS (SELECT 1 FROM dbo.ExecutionManifest em WHERE em.SchemaName = vp.SchemaName AND em.TableName = vp.TableName AND em.Status = 'Active');
+
+    /* PHASE 10: INDEXES */
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    SELECT @RunId, 10, 'CREATE_INDEX', idx.SchemaName, idx.TableName, @Sort + 80000 + ROW_NUMBER() OVER (ORDER BY idx.SchemaName, idx.TableName, idx.IndexName), 'INDEX', 
+        'IF NOT EXISTS(SELECT 1 FROM ' + @Q + '.sys.indexes WHERE name=''' + idx.IndexName + ''') CREATE ' + CASE WHEN idx.IsUnique = 1 THEN 'UNIQUE ' ELSE '' END + 'NONCLUSTERED INDEX ' + QUOTENAME(idx.IndexName) + ' ON ' + @Q + '.' + QUOTENAME(idx.SchemaName) + '.' + QUOTENAME(idx.TableName) + ' (' + idx.KeyColumns + ');' 
+    FROM dbo.TableIndexes idx 
+    WHERE idx.DatabaseName = @Tpl AND idx.IsPrimaryKey = 0 AND EXISTS (SELECT 1 FROM dbo.ExecutionManifest em WHERE em.SchemaName = idx.SchemaName AND em.TableName = idx.TableName AND em.Status = 'Active');
+
+    /* PHASE 11: TASK DEPENDENCIES FROM BATCHDEPENDENCYPLAN */
+    INSERT dbo.TaskDependency (TaskId, DependsOnTaskId) 
+    SELECT DISTINCT t1.TaskId, t2.TaskId 
+    FROM dbo.BatchDependencyPlan bdp 
+    JOIN dbo.MigrationBatchPlan mbp1 ON mbp1.BatchId = bdp.BatchId 
+    JOIN dbo.MigrationBatchPlan mbp2 ON mbp2.BatchId = bdp.DependsOnBatch 
+    JOIN dbo.MigrationSourcePlan msp1 ON msp1.SourceDB = mbp1.SourceDB 
+    JOIN dbo.MigrationSourcePlan msp2 ON msp2.SourceDB = mbp2.SourceDB 
+    JOIN dbo.MigrationTasks t1 ON t1.RunId = @RunId AND t1.SourceDB = msp1.SourceDB 
+    JOIN dbo.MigrationTasks t2 ON t2.RunId = @RunId AND t2.SourceDB = msp2.SourceDB AND t2.SchemaName = t1.SchemaName AND t2.TableName = t1.TableName 
+    WHERE bdp.DependencyType = 'BaseMerge' AND NOT EXISTS (SELECT 1 FROM dbo.TaskDependency td WHERE td.TaskId = t1.TaskId AND td.DependsOnTaskId = t2.TaskId) AND t1.TaskId <> t2.TaskId;
+
+    /* PHASE 12: FINALIZE */
+    SET @Sort = 1000000; 
+    INSERT dbo.MigrationTasks (RunId, PhaseId, PhaseName, SchemaName, TableName, ExecutionOrder, TaskType, TaskSQL) 
+    VALUES (@RunId, 12, 'FINALIZE', 'dbo', 'Summary', @Sort, 'FINALIZE', 
+        'DECLARE @t INT,@c INT,@f INT,@sk INT,@b INT; SELECT @t=COUNT(*) FROM dbo.MigrationTasks WHERE RunId=''' + CAST(@RunId AS NVARCHAR(40)) + '''; SELECT @c=COUNT(*) FROM dbo.MigrationTasks WHERE RunId=''' + CAST(@RunId AS NVARCHAR(40)) + ''' AND Status=''COMPLETED''; SELECT @f=COUNT(*) FROM dbo.MigrationTasks WHERE RunId=''' + CAST(@RunId AS NVARCHAR(40)) + ''' AND Status=''FAILED''; SELECT @sk=COUNT(*) FROM dbo.MigrationTasks WHERE RunId=''' + CAST(@RunId AS NVARCHAR(40)) + ''' AND Status=''SKIPPED''; SELECT @b=COUNT(*) FROM dbo.MigrationTasks WHERE RunId=''' + CAST(@RunId AS NVARCHAR(40)) + ''' AND Status=''BLOCKED''; UPDATE dbo.MigrationRun SET EndTime=SYSUTCDATETIME(),TotalTasks=@t,CompletedTasks=@c,FailedTasks=@f,SkippedTasks=@sk,BlockedTasks=@b,Status=CASE WHEN @f>0 THEN ''COMPLETED_WITH_ERRORS'' WHEN @b>0 THEN ''PARTIAL'' ELSE ''SUCCESS'' END WHERE RunId=''' + CAST(@RunId AS NVARCHAR(40)) + ''';');
+    
+    DECLARE @TC INT; 
+    SELECT @TC = COUNT(*) FROM dbo.MigrationTasks WHERE RunId = @RunId; 
+    UPDATE dbo.MigrationRun SET TotalTasks = @TC WHERE RunId = @RunId; 
+    
+    SET @Msg = '[COMPILE] ' + CAST(@TC AS NVARCHAR) + ' tasks compiled.'; 
+    EXEC dbo.usp_Log @RunId, NULL, 'INFO', @Msg; 
+END
+GO
+
+/* ═══ EXECUTION ENGINE ═══ */
+CREATE OR ALTER PROCEDURE dbo.usp_ExecuteMigration @RunId UNIQUEIDENTIFIER = NULL OUTPUT AS BEGIN 
+    SET NOCOUNT ON; 
+    
+    DECLARE @Tgt SYSNAME = dbo.fn_GetTargetDB(); 
+    DECLARE @Tpl SYSNAME = dbo.fn_GetTemplateDB(); 
+    DECLARE @HO SYSNAME = dbo.fn_GetMasterSourceDB(); 
+    DECLARE @Q NVARCHAR(256) = QUOTENAME(@Tgt); 
+    DECLARE @Msg NVARCHAR(MAX);
+    
+    IF @RunId IS NULL 
+    BEGIN 
+        SET @RunId = NEWID(); 
+        INSERT dbo.MigrationRun (RunId, TargetDB, TemplateDB, MasterSourceDB, StartTime, Status) 
+        VALUES (@RunId, @Tgt, @Tpl, @HO, SYSUTCDATETIME(), 'RUNNING'); 
+        SET @Msg = '[RUN] Created: ' + CAST(@RunId AS NVARCHAR(40)); 
+        PRINT @Msg; 
+        EXEC dbo.usp_Log @RunId, NULL, 'INFO', @Msg; 
+        EXEC dbo.usp_CompileTasks @RunId; 
+    END 
+    ELSE 
+    BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM dbo.MigrationRun WHERE RunId = @RunId) 
+            THROW 51030, 'RunId not found.', 10; 
+        IF NOT EXISTS (SELECT 1 FROM dbo.MigrationTasks WHERE RunId = @RunId) 
+            EXEC dbo.usp_CompileTasks @RunId; 
+    END
+    
+    DECLARE @TaskId BIGINT, @PhaseId INT, @PhaseName NVARCHAR(50), @Sch SYSNAME, @Tbl SYSNAME; 
+    DECLARE @TSQL NVARCHAR(MAX), @TT NVARCHAR(32), @IdIns BIT; 
+    DECLARE @Start DATETIME2, @Rows BIGINT, @Done INT = 0; 
+    DECLARE @TotalTasks INT = (SELECT COUNT(*) FROM dbo.MigrationTasks WHERE RunId = @RunId); 
+    DECLARE @idSQL NVARCHAR(500), @identityCheckSQL NVARCHAR(MAX), @TargetHasIdentity BIT; 
+    DECLARE @ExecIdIns BIT, @LastSQL NVARCHAR(MAX); 
+    DECLARE @BatchDone BIT = 0; 
+    
+    SET @Msg = '[RUN] Executing ' + CAST(@TotalTasks AS NVARCHAR) + ' tasks...'; 
+    PRINT @Msg;
+    
+    WHILE @BatchDone = 0 
+    BEGIN 
+        SET @BatchDone = 1; 
+        
+        DECLARE tc CURSOR LOCAL FAST_FORWARD FOR 
+        SELECT TOP 200 TaskId, PhaseId, PhaseName, SchemaName, TableName, TaskSQL, TaskType, RequiresIdentityInsert 
+        FROM dbo.MigrationTasks 
+        WHERE RunId = @RunId AND Status = 'PENDING' 
+            AND NOT EXISTS (SELECT 1 FROM dbo.TaskDependency td WHERE td.TaskId = MigrationTasks.TaskId AND td.DependsOnTaskId IN (SELECT TaskId FROM dbo.MigrationTasks WHERE RunId = @RunId AND Status NOT IN ('COMPLETED', 'SKIPPED'))) 
+        ORDER BY PhaseId, ExecutionOrder, TaskId; 
+        
+        OPEN tc; 
+        FETCH NEXT FROM tc INTO @TaskId, @PhaseId, @PhaseName, @Sch, @Tbl, @TSQL, @TT, @IdIns; 
+        
+        WHILE @@FETCH_STATUS = 0 
+        BEGIN 
+            SET @BatchDone = 0; 
+            SET @Done += 1; 
+            SET @Start = SYSUTCDATETIME(); 
+            
+            IF @Done % 100 = 0 
+            BEGIN 
+                UPDATE dbo.MigrationCheckpoint SET LastCompletedTaskId = @TaskId, LastPhaseId = @PhaseId, UpdatedAt = SYSUTCDATETIME() WHERE RunId = @RunId; 
+                IF @@ROWCOUNT = 0 
+                    INSERT dbo.MigrationCheckpoint (RunId, LastCompletedTaskId, LastPhaseId) VALUES (@RunId, @TaskId, @PhaseId); 
+                SET @Msg = '  [RUN] ' + CAST(@Done AS NVARCHAR) + '/' + CAST(@TotalTasks AS NVARCHAR) + ' (phase=' + @PhaseName + ')'; 
+                PRINT @Msg; 
+            END
+            
+            BEGIN TRY 
+                SET @ExecIdIns = CASE WHEN @TT IN ('HO', 'REGION') THEN 0 ELSE @IdIns END; 
+                SET @LastSQL = @TSQL; 
+                
+                IF @PhaseId > 0 AND @TT NOT IN ('HO', 'REGION') AND @ExecIdIns = 0 
+                BEGIN 
+                    SET @TargetHasIdentity = 0; 
+                    SET @identityCheckSQL = N'SELECT @out=CASE WHEN EXISTS(SELECT 1 FROM ' + @Q + N'.sys.columns c JOIN ' + @Q + N'.sys.tables t ON t.object_id=c.object_id JOIN ' + @Q + N'.sys.schemas s ON s.schema_id=t.schema_id WHERE s.name=@s AND t.name=@t AND c.is_identity=1) THEN 1 ELSE 0 END;'; 
+                    EXEC sp_executesql @identityCheckSQL, N'@s SYSNAME, @t SYSNAME, @out BIT OUTPUT', @s = @Sch, @t = @Tbl, @out = @TargetHasIdentity OUTPUT; 
+                    IF @TargetHasIdentity = 1 
+                    BEGIN 
+                        SET @ExecIdIns = 1; 
+                        UPDATE dbo.MigrationTasks SET RequiresIdentityInsert = 1 WHERE TaskId = @TaskId; 
+                        SET @Msg = N'  [IDENTITY] Runtime detected identity column for ' + @Sch + N'.' + @Tbl + N'; enabling IDENTITY_INSERT.'; 
+                        PRINT @Msg; 
+                    END 
+                END
+                
+                UPDATE dbo.MigrationTasks SET Status = 'RUNNING', StartedAt = @Start WHERE TaskId = @TaskId; 
+                
+                IF @ExecIdIns = 1 
+                BEGIN 
+                    SET @idSQL = N'SET IDENTITY_INSERT ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' ON;'; 
+                    SET @LastSQL = @idSQL; 
+                    EXEC sp_executesql @idSQL; 
+                END 
+                
+                SET @LastSQL = @TSQL; 
+                EXEC sp_executesql @TSQL; 
+                SET @Rows = @@ROWCOUNT; 
+                
+                IF @ExecIdIns = 1 
+                BEGIN 
+                    SET @idSQL = N'SET IDENTITY_INSERT ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' OFF;'; 
+                    SET @LastSQL = @idSQL; 
+                    EXEC sp_executesql @idSQL; 
+                END 
+                
+                UPDATE dbo.MigrationTasks SET Status = 'COMPLETED', CompletedAt = SYSUTCDATETIME(), RowsAffected = @Rows WHERE TaskId = @TaskId; 
+                INSERT dbo.TaskExecution (TaskId, RunId, StartTime, EndTime, ElapsedMs, RowsWritten, Status) 
+                VALUES (@TaskId, @RunId, @Start, SYSUTCDATETIME(), DATEDIFF(MILLISECOND, @Start, SYSUTCDATETIME()), @Rows, 'COMPLETED'); 
+            END TRY 
+            BEGIN CATCH 
+                DECLARE @EN INT, @EL INT, @ES INT, @ESt INT, @EM NVARCHAR(MAX); 
+                DECLARE @EP NVARCHAR(256), @ET NVARCHAR(20), @SR BIT, @MR INT, @RC INT; 
+                
+                SET @EN = ERROR_NUMBER(); 
+                SET @EL = ERROR_LINE(); 
+                SET @ES = ERROR_SEVERITY(); 
+                SET @ESt = ERROR_STATE(); 
+                SET @EP = ISNULL(ERROR_PROCEDURE(), '<dynamic-sql>'); 
+                SET @EM = ERROR_MESSAGE(); 
+                SET @ET = dbo.fn_GetErrorCategory(@EN); 
+                SET @SR = dbo.fn_ShouldRetry(@EN); 
+                SET @MR = dbo.fn_GetMaxRetries(@EN); 
+                
+                IF @ExecIdIns = 1 
+                BEGIN 
+                    BEGIN TRY 
+                        SET @idSQL = N'SET IDENTITY_INSERT ' + @Q + N'.' + QUOTENAME(@Sch) + N'.' + QUOTENAME(@Tbl) + N' OFF;'; 
+                        EXEC sp_executesql @idSQL; 
+                    END TRY 
+                    BEGIN CATCH 
+                    END CATCH 
+                END
+                
+                UPDATE dbo.MigrationTasks SET Status = 'FAILED', CompletedAt = SYSUTCDATETIME(), ErrorMessage = @EM, RetryCount = RetryCount + 1, LastErrorNumber = @EN, LastErrorType = @ET WHERE TaskId = @TaskId; 
+                SET @RC = (SELECT RetryCount FROM dbo.MigrationTasks WHERE TaskId = @TaskId); 
+                
+                IF @RC < @MR AND @SR = 1 
+                BEGIN 
+                    UPDATE dbo.MigrationTasks SET Status = 'PENDING' WHERE TaskId = @TaskId; 
+                    SET @Msg = '  [RETRY] Task ' + CAST(@TaskId AS NVARCHAR) + ' (' + CAST(@RC AS NVARCHAR) + '/' + CAST(@MR AS NVARCHAR) + ')'; 
+                    PRINT @Msg; 
+                END 
+                ELSE 
+                BEGIN 
+                    SET @Msg = '  [ERROR] Task ' + CAST(@TaskId AS NVARCHAR) + ' ' + @PhaseName + ' ' + ISNULL(@Sch, '') + '.' + ISNULL(@Tbl, '') + ' failed (Number=' + CAST(@EN AS NVARCHAR) + ', Severity=' + CAST(@ES AS NVARCHAR) + ', State=' + CAST(@ESt AS NVARCHAR) + ', Line=' + CAST(@EL AS NVARCHAR) + ', Proc=' + @EP + ', Type=' + ISNULL(@ET, 'OTHER') + '): ' + LEFT(@EM, 1200); 
+                    PRINT @Msg; 
+                    PRINT N'  [ERROR SQL] ' + LEFT(REPLACE(REPLACE(ISNULL(@LastSQL, @TSQL), CHAR(13), N' '), CHAR(10), N' '), 2000); 
+                    
+                    IF @PhaseId = 4 
+                    BEGIN 
+                        UPDATE t SET Status = 'BLOCKED', ErrorMessage = ISNULL(ErrorMessage, 'Blocked by failed HO task ' + CAST(@TaskId AS NVARCHAR)) 
+                        FROM dbo.MigrationTasks t 
+                        WHERE t.RunId = @RunId AND t.Status = 'PENDING' AND t.PhaseId = 5 AND t.SchemaName = @Sch AND t.TableName = @Tbl; 
+                        
+                        UPDATE t SET Status = 'BLOCKED' 
+                        FROM dbo.MigrationTasks t 
+                        WHERE t.RunId = @RunId AND t.Status = 'PENDING' AND EXISTS (SELECT 1 FROM dbo.TaskDependency td WHERE td.TaskId = t.TaskId AND td.DependsOnTaskId = @TaskId); 
+                        
+                        SET @Msg = '  [GATE] HO failed: ' + @Sch + '.' + @Tbl + '. Blocked downstream. Root error: ' + LEFT(@EM, 800); 
+                        PRINT @Msg; 
+                    END 
+                END
+                
+                INSERT dbo.TaskExecution (TaskId, RunId, StartTime, EndTime, ElapsedMs, Status, ErrorMessage) 
+                VALUES (@TaskId, @RunId, @Start, SYSUTCDATETIME(), DATEDIFF(MILLISECOND, @Start, SYSUTCDATETIME()), 'FAILED', @EM); 
+                
+                INSERT dbo.ExecutionLog (RunId, TaskId, LogLevel, Message) 
+                VALUES (@RunId, @TaskId, 'ERROR', @PhaseName + ' ' + ISNULL(@Sch, '') + '.' + ISNULL(@Tbl, '') + ': Number=' + CAST(@EN AS NVARCHAR) + ', Severity=' + CAST(@ES AS NVARCHAR) + ', State=' + CAST(@ESt AS NVARCHAR) + ', Line=' + CAST(@EL AS NVARCHAR) + ', Proc=' + @EP + ', Message=' + LEFT(@EM, 2000) + ', SQL=' + LEFT(REPLACE(REPLACE(ISNULL(@TSQL, ''), CHAR(13), N' '), CHAR(10), N' '), 2000)); 
+            END CATCH 
+            
+            FETCH NEXT FROM tc INTO @TaskId, @PhaseId, @PhaseName, @Sch, @Tbl, @TSQL, @TT, @IdIns; 
+        END 
+        
+        CLOSE tc; 
+        DEALLOCATE tc;
+        
+        UPDATE t SET Status = 'BLOCKED' 
+        FROM dbo.MigrationTasks t 
+        WHERE t.RunId = @RunId AND t.Status = 'PENDING' AND EXISTS (SELECT 1 FROM dbo.TaskDependency td WHERE td.TaskId = t.TaskId AND td.DependsOnTaskId IN (SELECT TaskId FROM dbo.MigrationTasks WHERE RunId = @RunId AND Status IN ('FAILED', 'BLOCKED')));
+        
+        IF @BatchDone = 1 AND EXISTS (SELECT 1 FROM dbo.MigrationTasks WHERE RunId = @RunId AND Status = 'PENDING') 
+        BEGIN 
+            UPDATE t SET Status = 'BLOCKED', ErrorMessage = ISNULL(t.ErrorMessage, 'Blocked: no runnable dependency path remains.') 
+            FROM dbo.MigrationTasks t 
+            WHERE t.RunId = @RunId AND t.Status = 'PENDING' AND EXISTS (SELECT 1 FROM dbo.TaskDependency td JOIN dbo.MigrationTasks d ON d.TaskId = td.DependsOnTaskId WHERE td.TaskId = t.TaskId AND d.RunId = @RunId AND d.Status NOT IN ('COMPLETED', 'SKIPPED')); 
+        END
+        
+        IF NOT EXISTS (SELECT 1 FROM dbo.MigrationTasks WHERE RunId = @RunId AND Status = 'PENDING') 
+            SET @BatchDone = 1; 
+    END
+    
+    DECLARE @Cmp INT, @Fl INT, @Sk INT, @Bl INT; 
+    SELECT @Cmp = COUNT(*) FROM dbo.MigrationTasks WHERE RunId = @RunId AND Status = 'COMPLETED'; 
+    SELECT @Fl = COUNT(*) FROM dbo.MigrationTasks WHERE RunId = @RunId AND Status = 'FAILED'; 
+    SELECT @Sk = COUNT(*) FROM dbo.MigrationTasks WHERE RunId = @RunId AND Status = 'SKIPPED'; 
+    SELECT @Bl = COUNT(*) FROM dbo.MigrationTasks WHERE RunId = @RunId AND Status = 'BLOCKED'; 
+    
+    UPDATE dbo.MigrationRun SET EndTime = SYSUTCDATETIME(), CompletedTasks = @Cmp, FailedTasks = @Fl, SkippedTasks = @Sk, BlockedTasks = @Bl, Status = CASE WHEN @Fl > 0 THEN 'COMPLETED_WITH_ERRORS' WHEN @Bl > 0 THEN 'PARTIAL' ELSE 'SUCCESS' END WHERE RunId = @RunId;
+    
+    PRINT ''; 
+    PRINT '══════════════════════════════════════════════════'; 
+    PRINT '[RUN] COMPLETE'; 
+    PRINT '  RunId:     ' + CAST(@RunId AS NVARCHAR(40)); 
+    PRINT '  Total:     ' + CAST(@TotalTasks AS NVARCHAR); 
+    PRINT '  Completed: ' + CAST(@Cmp AS NVARCHAR); 
+    PRINT '  Failed:    ' + CAST(@Fl AS NVARCHAR); 
+    PRINT '  Skipped:   ' + CAST(@Sk AS NVARCHAR); 
+    PRINT '  Blocked:   ' + CAST(@Bl AS NVARCHAR); 
+    
+    DECLARE @FinalStatus NVARCHAR(30) = (SELECT Status FROM dbo.MigrationRun WHERE RunId = @RunId); 
+    PRINT '  Status:    ' + @FinalStatus; 
+    PRINT '══════════════════════════════════════════════════';
+    
+    IF EXISTS (SELECT 1 FROM dbo.ValidationResults WHERE RunId = @RunId) 
+    BEGIN 
+        PRINT ''; 
+        PRINT 'VALIDATION:'; 
+        SELECT Status, COUNT(*) AS Tables, SUM(ExpectedCount) AS Expected, SUM(ActualCount) AS Actual 
+        FROM dbo.ValidationResults 
+        WHERE RunId = @RunId 
+        GROUP BY Status 
+        ORDER BY Status; 
+    END
+    
+    PRINT ''; 
+    PRINT 'PHASES:'; 
+    SELECT PhaseName, COUNT(*) AS Total, SUM(CASE WHEN Status = 'COMPLETED' THEN 1 ELSE 0 END) AS OK, SUM(CASE WHEN Status = 'FAILED' THEN 1 ELSE 0 END) AS Fail, SUM(CASE WHEN Status = 'BLOCKED' THEN 1 ELSE 0 END) AS Blocked 
+    FROM dbo.MigrationTasks 
+    WHERE RunId = @RunId 
+    GROUP BY PhaseName 
+    ORDER BY MIN(PhaseId); 
+END
+GO
+
+/* ═══ EXECUTION ═══ */
+PRINT ''; 
+PRINT '══════════════════════════════════════════════════'; 
+PRINT 'LAYER 3 V10.0: MIGRATION EXECUTION ENGINE'; 
+PRINT '══════════════════════════════════════════════════';
+
+DECLARE @RunId UNIQUEIDENTIFIER;
+EXEC dbo.usp_ExecuteMigration @RunId = @RunId OUTPUT;
+
+SELECT * FROM dbo.MigrationRun WHERE RunId = @RunId;
+SELECT * FROM dbo.ValidationResults WHERE RunId = @RunId;
+SELECT PhaseName, Status, SchemaName, TableName, LEFT(ErrorMessage, 200) AS Error 
+FROM dbo.MigrationTasks 
+WHERE RunId = @RunId AND Status = 'FAILED' 
+ORDER BY PhaseId, TaskId;
+
+PRINT ''; 
+PRINT 'LAYER 3 ~ V10.0 COMPLETED ' + CONVERT(NVARCHAR(30), GETDATE(), 121);
+GO
