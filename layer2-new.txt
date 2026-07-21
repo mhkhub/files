@@ -1,0 +1,1876 @@
+/* ═══════════════════════════════════════════════════════════════════
+LAYER 2 V11: INTELLIGENCE & PLANNING ENGINE ~ Ownership-First Architecture with 4 Milestones, 12 Tasks
+═══════════════════════════════════════════════════════════════════ */
+GO
+SET NOCOUNT ON; SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON;
+GO
+DECLARE @msg NVARCHAR(300)=N'LAYER 2 V11 ~ START '+CONVERT(NVARCHAR(30),GETDATE(),121); PRINT @msg;
+GO
+IF DB_ID(N'MasterMerge') IS NULL THROW 51010,'MasterMerge not found. Run Layer 1 first.',10;
+GO
+USE MasterMerge;
+GO
+
+-- ═══ PHASE 0: CLEANUP ═══
+PRINT N'[PHASE 0] Cleaning up old objects...';
+
+-- Drop tables with FK constraints first
+IF OBJECT_ID('dbo.MigrationSourcePlan', 'U') IS NOT NULL DROP TABLE dbo.MigrationSourcePlan;
+IF OBJECT_ID('dbo.MigrationExecutionContract', 'U') IS NOT NULL DROP TABLE dbo.MigrationExecutionContract;
+IF OBJECT_ID('dbo.IdentityEvidence', 'U') IS NOT NULL DROP TABLE dbo.IdentityEvidence;
+IF OBJECT_ID('dbo.IdentityScorecard', 'U') IS NOT NULL DROP TABLE dbo.IdentityScorecard;
+IF OBJECT_ID('dbo.EvidenceCatalog', 'U') IS NOT NULL DROP TABLE dbo.EvidenceCatalog;
+IF OBJECT_ID('dbo.EvidenceWeights', 'U') IS NOT NULL DROP TABLE dbo.EvidenceWeights;
+IF OBJECT_ID('dbo.TableScoreBreakdown', 'U') IS NOT NULL DROP TABLE dbo.TableScoreBreakdown;
+IF OBJECT_ID('dbo.TableScores', 'U') IS NOT NULL DROP TABLE dbo.TableScores;
+IF OBJECT_ID('dbo.CategoryPlan', 'U') IS NOT NULL DROP TABLE dbo.CategoryPlan;
+IF OBJECT_ID('dbo.StrategyPlan', 'U') IS NOT NULL DROP TABLE dbo.StrategyPlan;
+IF OBJECT_ID('dbo.SourcePolicyPlan', 'U') IS NOT NULL DROP TABLE dbo.SourcePolicyPlan;
+IF OBJECT_ID('dbo.MigrationAnalysis', 'U') IS NOT NULL DROP TABLE dbo.MigrationAnalysis;
+IF OBJECT_ID('dbo.KeyStrategyPlan', 'U') IS NOT NULL DROP TABLE dbo.KeyStrategyPlan;
+IF OBJECT_ID('dbo.MergeKeyPlan', 'U') IS NOT NULL DROP TABLE dbo.MergeKeyPlan;
+IF OBJECT_ID('dbo.ExecutionDependencyPlan', 'U') IS NOT NULL DROP TABLE dbo.ExecutionDependencyPlan;
+IF OBJECT_ID('dbo.FKRewritePlan', 'U') IS NOT NULL DROP TABLE dbo.FKRewritePlan;
+IF OBJECT_ID('dbo.ValidationPlan', 'U') IS NOT NULL DROP TABLE dbo.ValidationPlan;
+IF OBJECT_ID('dbo.TranslationPlan', 'U') IS NOT NULL DROP TABLE dbo.TranslationPlan;
+IF OBJECT_ID('dbo.ExecutionManifest', 'U') IS NOT NULL DROP TABLE dbo.ExecutionManifest;
+IF OBJECT_ID('dbo.IdentityPlan', 'U') IS NOT NULL DROP TABLE dbo.IdentityPlan;
+IF OBJECT_ID('dbo.GateKeeper', 'U') IS NOT NULL DROP TABLE dbo.GateKeeper;
+
+PRINT N'[PHASE 0] Cleanup complete.';
+GO
+CREATE OR ALTER FUNCTION dbo.GetTemplateDB() RETURNS SYSNAME AS BEGIN
+DECLARE @db SYSNAME;
+SELECT TOP 1 @db=DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 AND DatabaseRole=N'Template';
+IF @db IS NULL SELECT TOP 1 @db=DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 AND IsTemplate=1;
+IF @db IS NULL SELECT TOP 1 @db=DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 ORDER BY Ord;
+RETURN @db;
+END;
+GO
+CREATE OR ALTER FUNCTION dbo.GetMasterSourceDB() RETURNS SYSNAME AS BEGIN
+DECLARE @db SYSNAME;
+SELECT TOP 1 @db=DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 AND DatabaseRole=N'HO';
+RETURN @db;
+END;
+
+GO
+-- ═══ PHASE 1: CREATE CONTRACT VALIDATION TABLE ═══
+CREATE TABLE dbo.GateKeeper(CheckId INT IDENTITY PRIMARY KEY,Category NVARCHAR(64) NOT NULL,Severity NVARCHAR(16) NOT NULL,SchemaName SYSNAME NULL,TableName SYSNAME NULL,Message NVARCHAR(MAX) NOT NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+GO
+-- ═══ SINGLE CONSOLIDATED GATEKEEPER PROCEDURE ═══
+CREATE OR ALTER PROCEDURE dbo.usp_GateKeeperPass @VId UNIQUEIDENTIFIER OUTPUT, @Passed BIT OUTPUT, @ErrCnt INT OUTPUT, @ShowSel BIT = 1
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @VId = NEWID();
+    SET @ErrCnt = 0;
+    SET @Passed = 1;
+    
+    DECLARE @TplDB SYSNAME = (SELECT TOP 1 DBName FROM dbo.DiscoveryConfig WHERE IsActive = 1 AND IsTemplate = 1);
+    DECLARE @MstrDB SYSNAME = (SELECT TOP 1 DBName FROM dbo.DiscoveryConfig WHERE IsActive = 1 AND DatabaseRole = N'HO');
+    IF OBJECT_ID('dbo.ContractValidationResults', 'U') IS NOT NULL DROP TABLE dbo.ContractValidationResults;
+    CREATE TABLE dbo.ContractValidationResults(CheckId INT IDENTITY PRIMARY KEY,Category NVARCHAR(32) NOT NULL,Severity NVARCHAR(16) NOT NULL,SchemaName SYSNAME NULL,TableName SYSNAME NULL,Message NVARCHAR(512) NOT NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+    
+    IF @MstrDB IS NULL
+    BEGIN
+        INSERT INTO dbo.ContractValidationResults(Category, Severity, Message)
+        VALUES (N'Config', N'ERROR', N'No HO database configured.');
+        SET @ErrCnt = 1;
+        SET @Passed = 0;
+        RETURN;
+    END
+    
+    -- CHECK 1: Manifest Consistency
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'Manifest', N'ERROR', k.SchemaName, k.TableName, N'KSP has no MigrationExecutionContract.'
+    FROM dbo.KeyStrategyPlan k
+    WHERE NOT EXISTS(SELECT 1 FROM dbo.MigrationExecutionContract c 
+                     WHERE c.SchemaName = k.SchemaName AND c.TableName = k.TableName);
+    
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'Contract', N'ERROR', SchemaName, TableName, N'Required fields NULL.'
+    FROM dbo.MigrationExecutionContract
+    WHERE UniquenessStrategy IS NULL OR MigrationMethod IS NULL OR ExecutionPhaseId IS NULL;
+    
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'Validation', N'ERROR', c.SchemaName, c.TableName, N'Method ' + c.MigrationMethod + N' needs validation.'
+    FROM dbo.MigrationExecutionContract c
+    WHERE c.IsUnsupported = 0
+      AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW', N'REJECTED')
+      AND c.MigrationMethod IN(N'INSERT_ONLY', N'REKEY', N'EXPAND_PK', N'MERGE_TO_MASTER', N'MERGE_LOOKUP', N'OVERWRITE', N'PRESERVE')
+      AND NOT EXISTS(SELECT 1 FROM dbo.ValidationPlan v 
+                     WHERE v.SchemaName = c.SchemaName AND v.TableName = c.TableName);
+    
+    -- CHECK 2: Topology
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'FKRewrite', N'ERROR', k.SchemaName, k.TableName, N'ExpandPK non-self FKs no FKRewritePlan.'
+    FROM dbo.KeyStrategyPlan k
+    WHERE k.UniquenessStrategy = N'ExpandPK'
+      AND k.IsUnsupported = 0
+      AND k.GovernanceStatus NOT IN(N'PENDING_REVIEW', N'REJECTED')
+      AND NOT EXISTS(SELECT 1 FROM dbo.FKRewritePlan f 
+                     WHERE f.ParentSchema = k.SchemaName AND f.ParentTable = k.TableName)
+      AND EXISTS(SELECT 1 FROM dbo.TableFKDetails fk 
+                 WHERE fk.DatabaseName = @TplDB AND fk.ReferencedSchema = k.SchemaName 
+                   AND fk.ReferencedTable = k.TableName AND fk.IsSelfReference = 0);
+    
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'Topology', N'ERROR', c1.SchemaName, c1.TableName,
+           N'Child ExecOrder (' + CAST(c1.ExecutionOrder AS NVARCHAR) + N') <= parent '
+           + fk.ReferencedTable + N' (' + CAST(c2.ExecutionOrder AS NVARCHAR) + N').'
+    FROM dbo.MigrationExecutionContract c1
+    JOIN dbo.TableFKDetails fk ON fk.SchemaName = c1.SchemaName AND fk.TableName = c1.TableName
+        AND fk.DatabaseName = @TplDB AND fk.IsSelfReference = 0
+    JOIN dbo.MigrationExecutionContract c2 ON c2.SchemaName = fk.ReferencedSchema AND c2.TableName = fk.ReferencedTable
+    WHERE c1.ExecutionOrder <= c2.ExecutionOrder
+      AND c1.IsUnsupported = 0 AND c2.IsUnsupported = 0;
+    
+    -- CHECK 3: Source Plan
+    DECLARE @RegionCnt INT = (SELECT COUNT(*) FROM dbo.DiscoveryConfig WHERE IsActive = 1 AND DatabaseRole = N'Region');
+    DECLARE @Exp INT, @Act INT;
+    
+    SELECT @Exp = SUM(CASE
+        WHEN SourcePolicy = N'HO_ONLY'     THEN 1 + @RegionCnt
+        WHEN SourcePolicy = N'REGION_ONLY' THEN @RegionCnt
+        WHEN SourcePolicy = N'BOTH'        THEN 1 + @RegionCnt
+        ELSE 0 END)
+    FROM dbo.MigrationExecutionContract
+    WHERE IsUnsupported = 0 AND GovernanceStatus NOT IN(N'REJECTED', N'PENDING_REVIEW');
+    
+    SET @Act = (SELECT COUNT(*) FROM dbo.MigrationSourcePlan);
+    
+    IF @Act <> @Exp
+        INSERT INTO dbo.ContractValidationResults(Category, Severity, Message)
+        VALUES (N'SrcPlan', N'ERROR', N'Expected ' + CAST(@Exp AS NVARCHAR) + N' found ' + CAST(@Act AS NVARCHAR));
+    
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'Missing', N'ERROR', c.SchemaName, c.TableName, N'No source plan for ' + dc.DBName
+    FROM dbo.MigrationExecutionContract c
+    CROSS JOIN dbo.DiscoveryConfig dc
+    WHERE c.IsUnsupported = 0
+      AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW', N'REJECTED')
+      AND dc.IsActive = 1
+      AND ((c.SourcePolicy = N'HO_ONLY'     AND dc.DatabaseRole IN(N'HO', N'Region'))
+        OR (c.SourcePolicy = N'REGION_ONLY' AND dc.DatabaseRole = N'Region')
+        OR (c.SourcePolicy = N'BOTH'        AND dc.DatabaseRole IN(N'HO', N'Region')))
+      AND NOT EXISTS(SELECT 1 FROM dbo.MigrationSourcePlan m 
+                     WHERE m.ContractId = c.ContractId AND m.SourceDB = dc.DBName);
+    
+    -- CHECK 4: Master References
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'MTM_Consistency', N'ERROR', k.SchemaName, k.TableName, N'MergeToMaster MasterKey/Entity NULL.'
+    FROM dbo.KeyStrategyPlan k
+    WHERE k.MigrationStrategy = N'MergeToMaster'
+      AND (k.MasterKeyColumn IS NULL OR k.MasterEntity = N'Unknown');
+    
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'HO_Required', N'ERROR', k.SchemaName, k.TableName, N'MTM HO empty, region has data.'
+    FROM dbo.KeyStrategyPlan k
+    WHERE k.MigrationStrategy = N'MergeToMaster'
+      AND k.IsUnsupported = 0
+      AND NOT EXISTS(SELECT 1 FROM dbo.TableDetails td 
+                     WHERE td.DatabaseName = @MstrDB AND td.SchemaName = k.SchemaName 
+                       AND td.TableName = k.TableName AND td.[RowCount] > 0)
+      AND EXISTS(SELECT 1 FROM dbo.TableDetails td2 
+                 JOIN dbo.DiscoveryConfig dc ON dc.DBName = td2.DatabaseName AND dc.DatabaseRole = N'Region' AND dc.IsActive = 1
+                 WHERE td2.SchemaName = k.SchemaName AND td2.TableName = k.TableName AND td2.[RowCount] > 0);
+    
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'HO_ONLY_REKEY', N'ERROR', c.SchemaName, c.TableName, N'HO_ONLY + REKEY contradiction.'
+    FROM dbo.MigrationExecutionContract c
+    WHERE c.SourcePolicy = N'HO_ONLY' AND c.MigrationMethod = N'REKEY' AND c.IsUnsupported = 0;
+    
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'Regression', N'WARNING', ec.SchemaName, ec.TableName,
+           N'Mismatch: ' + STUFF(
+               (CASE WHEN ec.ExpectedCategory IS NOT NULL AND (ma.WinnerCategory <> ec.ExpectedCategory OR ma.WinnerCategory IS NULL)
+                     THEN N'; Cat expected ' + ec.ExpectedCategory + N' got ' + ISNULL(ma.WinnerCategory, N'?') ELSE N'' END)
+             + (CASE WHEN ec.ExpectedStrategy IS NOT NULL AND (ma.MigrationStrategy <> ec.ExpectedStrategy OR ma.MigrationStrategy IS NULL)
+                     THEN N'; Strat expected ' + ec.ExpectedStrategy + N' got ' + ISNULL(ma.MigrationStrategy, N'?') ELSE N'' END)
+             + (CASE WHEN ec.ExpectedSourcePolicy IS NOT NULL AND (ma.SourcePolicy <> ec.ExpectedSourcePolicy OR ma.SourcePolicy IS NULL)
+                     THEN N'; Pol expected ' + ec.ExpectedSourcePolicy + N' got ' + ISNULL(ma.SourcePolicy, N'?') ELSE N'' END), 1, 2, N'')
+    FROM dbo.ExpectedClassification ec
+    LEFT JOIN dbo.MigrationAnalysis ma ON ma.SchemaName = ec.SchemaName AND ma.TableName = ec.TableName
+    WHERE (ec.ExpectedCategory IS NOT NULL AND (ma.WinnerCategory <> ec.ExpectedCategory OR ma.WinnerCategory IS NULL))
+       OR (ec.ExpectedStrategy IS NOT NULL AND (ma.MigrationStrategy <> ec.ExpectedStrategy OR ma.MigrationStrategy IS NULL))
+       OR (ec.ExpectedSourcePolicy IS NOT NULL AND (ma.SourcePolicy <> ec.ExpectedSourcePolicy OR ma.SourcePolicy IS NULL));
+    
+    -- CHECK 5: Schema Drift
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'Drift', N'ERROR', SchemaName, TableName, N'Blocking drift ' + DriftType + N' on ' + ColumnName
+    FROM dbo.SchemaDriftMatrix
+    WHERE DriftSeverity = N'ERROR' AND DriftType NOT IN(N'MISSING_COLUMN', N'TYPE_MISMATCH');
+    
+    -- CHECK 6: Plan Consistency
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'PlanOrphan', N'ERROR', cp.SchemaName, cp.TableName, N'CategoryPlan no StrategyPlan.'
+    FROM dbo.CategoryPlan cp
+    WHERE NOT EXISTS(SELECT 1 FROM dbo.StrategyPlan sp 
+                     WHERE sp.SchemaName = cp.SchemaName AND sp.TableName = cp.TableName);
+    
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'PlanOrphan', N'ERROR', sp.SchemaName, sp.TableName, N'StrategyPlan no SourcePolicyPlan.'
+    FROM dbo.StrategyPlan sp
+    WHERE NOT EXISTS(SELECT 1 FROM dbo.SourcePolicyPlan spp 
+                     WHERE spp.SchemaName = sp.SchemaName AND spp.TableName = sp.TableName);
+    
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'SPP_Contradiction', N'ERROR', spp.SchemaName, spp.TableName, N'HO_ONLY + Rekey.'
+    FROM dbo.SourcePolicyPlan spp
+    JOIN dbo.StrategyPlan sp ON sp.SchemaName = spp.SchemaName AND sp.TableName = spp.TableName
+    WHERE spp.SourcePolicy = N'HO_ONLY' AND sp.MigrationStrategy = N'Rekey';
+    
+    -- CHECK 7: Unsupported
+    INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+    SELECT N'Unsupported',
+           CASE WHEN UnsupportedReason LIKE N'No data source:%' THEN N'INFO' ELSE N'WARNING' END,
+           SchemaName, TableName, N'Unsupported: ' + ISNULL(UnsupportedReason, N'<none>')
+    FROM dbo.MigrationExecutionContract WHERE IsUnsupported = 1;
+    
+    -- CHECK 8: Manual Overrides
+    IF OBJECT_ID('dbo.ManualClassificationOverride', 'U') IS NOT NULL
+        INSERT INTO dbo.ContractValidationResults(Category, Severity, SchemaName, TableName, Message)
+        SELECT N'ManualOverride', N'INFO', mco.SchemaName, mco.TableName,
+               N'Override: ' + ISNULL(mco.ForcedStrategy, N'<none>') + N'/' + ISNULL(mco.ForcedMigrationStrategy, N'<none>') + N'. ' + mco.Reason
+        FROM dbo.ManualClassificationOverride mco;
+    
+    -- Calculate final status
+    SELECT @ErrCnt = COUNT(*) FROM dbo.ContractValidationResults WHERE Severity = N'ERROR';
+    SET @Passed = CASE WHEN @ErrCnt > 0 THEN 0 ELSE 1 END;
+    
+    IF @ErrCnt > 0
+        PRINT N'[GATEKEEPER] FAILED with ' + CAST(@ErrCnt AS NVARCHAR) + N' error(s).';
+    ELSE
+        PRINT N'[GATEKEEPER] PASSED.';
+    
+    IF @ShowSel = 1
+    BEGIN
+        SELECT @TplDB AS TplDB, @MstrDB AS MstrDB, @Passed AS Passed,
+               @ErrCnt AS Errors,
+               (SELECT COUNT(*) FROM dbo.ContractValidationResults WHERE Severity = N'WARNING') AS Warnings;
+        
+        SELECT Category, Severity, SchemaName, TableName, Message
+        FROM dbo.ContractValidationResults
+        ORDER BY CASE Severity WHEN N'ERROR' THEN 1 WHEN N'WARNING' THEN 2 ELSE 3 END, Category;
+    END
+END;
+GO
+
+-- ═══════════════════════════════════════════════════════════════════
+-- MILESTONE I: IDENTITY OWNERSHIP MODEL (Problems 1-3)
+-- ═══════════════════════════════════════════════════════════════════
+PRINT N'[MILESTONE I] Identity Ownership Model...';
+
+-- ═══ DROP ALL PLANNING TABLES ═══
+DECLARE @t NVARCHAR(128);
+DECLARE cur CURSOR LOCAL FAST_FORWARD FOR SELECT name FROM(VALUES
+('dbo.IdentityPlan'),('dbo.CategoryPlan'),('dbo.StrategyPlan'),('dbo.SourcePolicyPlan'),
+('dbo.MigrationAnalysis'),('dbo.KeyStrategyPlan'),('dbo.MergeKeyPlan'),
+('dbo.MigrationExecutionContract'),('dbo.MigrationSourcePlan'),
+('dbo.IdentityReferencePlan'),('dbo.FKDependencyPlan'),('dbo.TranslationPlan'),
+('dbo.MigrationScenarioDefinition'),('dbo.CrossDatabaseComparison'),
+('dbo.DependencyGraph'),('dbo.NaturalKeyCandidates'),('dbo.TableEvidence'),
+('dbo.TableScoreBreakdown'),('dbo.TableScores'),
+('dbo.RekeyPlan'),('dbo.PKExpansionColumns'),
+('dbo.IDTranslationMap'),('dbo.FKRewritePlan'),
+('dbo.ExecutionPlan'),('dbo.ValidationPlan'),
+('dbo.PKExpansionPlan'),('dbo.ExecutionPhaseDefinition'),
+('dbo.IdentityReferencePlan'),('dbo.FKDependencyPlan'),('dbo.ContractValidationResults')
+)AS T(name);
+OPEN cur; FETCH NEXT FROM cur INTO @t;
+WHILE @@FETCH_STATUS=0 BEGIN IF OBJECT_ID(@t,'U')IS NOT NULL EXEC('DROP TABLE '+@t); FETCH NEXT FROM cur INTO @t; END
+CLOSE cur; DEALLOCATE cur;
+
+-- ═══ VOCABULARY VERSIONING ═══
+IF OBJECT_ID('dbo.VocabularyVersion','U') IS NULL
+CREATE TABLE dbo.VocabularyVersion(VocabId INT IDENTITY PRIMARY KEY,VocabType NVARCHAR(50) NOT NULL,VersionNo NVARCHAR(16) NOT NULL,IsActive BIT NOT NULL DEFAULT 1,EffectiveFrom DATETIME2 NULL,EffectiveTo DATETIME2 NULL,CONSTRAINT UQ_VV UNIQUE(VocabType));
+MERGE INTO dbo.VocabularyVersion AS tgt USING(VALUES(N'SemanticVocabulary',N'V1.0',1,'2024-01-01',NULL),(N'MasterEntityVocabulary',N'V1.0',1,'2024-01-01',NULL),(N'BusinessOwnerVocabulary',N'V1.0',1,'2024-01-01',NULL))AS src(VocabType,VersionNo,IsActive,EffectiveFrom,EffectiveTo) ON tgt.VocabType=src.VocabType WHEN NOT MATCHED THEN INSERT VALUES(src.VocabType,src.VersionNo,src.IsActive,src.EffectiveFrom,src.EffectiveTo);
+GO
+
+IF OBJECT_ID('dbo.MasterEntityVocabulary','U') IS NOT NULL DROP TABLE dbo.MasterEntityVocabulary;
+CREATE TABLE dbo.MasterEntityVocabulary(VocabId INT IDENTITY PRIMARY KEY,MasterEntity NVARCHAR(32) NOT NULL,ColumnPattern NVARCHAR(128) NOT NULL,MatchType NVARCHAR(16) NOT NULL,Priority INT NOT NULL,BaseConfidence INT NOT NULL,IsExtension BIT NOT NULL DEFAULT 0);
+INSERT INTO dbo.MasterEntityVocabulary VALUES
+('Employee','HOEmpID','EXACT',200,80,0),('Employee','AHOEmpID','EXACT',190,75,0),('Employee','EmployeeID','SUFFIX',65,45,0),('Employee','EmpId','SUFFIX',60,40,0),('Employee','EmpID','SUFFIX',70,50,0),
+('Company','HOCompanyID','EXACT',200,80,0),('Company','CompanyID','SUFFIX',100,60,0),
+('Customer','HOCustomerID','EXACT',200,80,0),('Customer','CustomerID','SUFFIX',90,40,0),
+('Vendor','HOVendorID','EXACT',200,80,0),('Vendor','VendorID','SUFFIX',90,40,0),
+('Agent','HOAgentID','EXACT',200,80,0),('Agent','AgentID','SUFFIX',90,40,0),
+('User','UserId','SUFFIX',60,40,0),('User','UserID','SUFFIX',55,35,0),
+('Carrier','HOCarrierID','EXACT',200,80,0),('Carrier','CarrierID','SUFFIX',65,45,0),
+('Party','HOPartyID','EXACT',190,70,0),('Party','PartyID','SUFFIX',60,40,0),
+('Supplier','HOSupplierID','EXACT',195,75,0),('Supplier','SupplierID','SUFFIX',85,45,0),
+('Warehouse','HOWarehouseID','EXACT',195,75,0),('Warehouse','WarehouseID','SUFFIX',80,40,0);
+
+-- ═══ EXPECTED CLASSIFICATION (Expanded Regression Suite) ═══
+IF OBJECT_ID('dbo.ExpectedClassification','U') IS NOT NULL DROP TABLE dbo.ExpectedClassification;
+CREATE TABLE dbo.ExpectedClassification(ExpectedId INT IDENTITY PRIMARY KEY,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ExpectedCategory NVARCHAR(32) NULL,ExpectedStrategy NVARCHAR(32) NULL,ExpectedSourcePolicy NVARCHAR(32) NULL,ExpectedMigrationMethod NVARCHAR(32) NULL,ExpectedMasterEntity NVARCHAR(64) NULL,Reason NVARCHAR(512) NULL,CONSTRAINT UQ_EC UNIQUE(SchemaName,TableName));
+MERGE INTO dbo.ExpectedClassification AS tgt USING(VALUES
+('dbo','genEmployeeSubordinates','Master','Preserve','HO_ONLY','PRESERVE','Employee','Emp rels'),
+('dbo','genEmployeeCategory','Lookup','Preserve','HO_ONLY','PRESERVE',NULL,'Emp cat'),
+('dbo','genEmployeeCommission','TransactionDetail','Preserve','REGION_ONLY','PRESERVE','Employee','Commission'),
+('dbo','genEmployeeDetail','TransactionDetail','Preserve','REGION_ONLY','PRESERVE','Employee','Detail'),
+('dbo','genEmployeeBranchAllocate','TransactionDetail','Preserve','REGION_ONLY','PRESERVE','Employee','Branch alloc'),
+('dbo','genEmployeeEmployeeAllocate','TransactionDetail','Preserve','REGION_ONLY','PRESERVE','Employee','Emp alloc'),
+('dbo','genUserAcitivty','TransactionDetail','Preserve','REGION_ONLY','PRESERVE','User','Activity'),
+('dbo','genUserDetail','TransactionDetail','Preserve','REGION_ONLY','PRESERVE','User','Detail'),
+('dbo','genUserLogin','TransactionDetail','Preserve','REGION_ONLY','PRESERVE','User','Login')
+)AS src(SchemaName,TableName,ExpectedCategory,ExpectedStrategy,ExpectedSourcePolicy,ExpectedMigrationMethod,ExpectedMasterEntity,Reason) ON tgt.SchemaName=src.SchemaName AND tgt.TableName=src.TableName WHEN MATCHED THEN UPDATE SET ExpectedCategory=src.ExpectedCategory,ExpectedStrategy=src.ExpectedStrategy,ExpectedSourcePolicy=src.ExpectedSourcePolicy,ExpectedMigrationMethod=src.ExpectedMigrationMethod,ExpectedMasterEntity=src.ExpectedMasterEntity,Reason=src.Reason WHEN NOT MATCHED THEN INSERT VALUES(src.SchemaName,src.TableName,src.ExpectedCategory,src.ExpectedStrategy,src.ExpectedSourcePolicy,src.ExpectedMigrationMethod,src.ExpectedMasterEntity,src.Reason);
+GO
+
+DECLARE @TemplateDB SYSNAME=dbo.GetTemplateDB();
+DECLARE @MasterSourceDB SYSNAME=dbo.GetMasterSourceDB();
+
+-- ═══ MIGRATION SCENARIO DEFINITION ═══
+IF OBJECT_ID('dbo.MigrationScenarioDefinition','U') IS NOT NULL DROP TABLE dbo.MigrationScenarioDefinition;
+CREATE TABLE dbo.MigrationScenarioDefinition(ScenarioId INT PRIMARY KEY,ScenarioName NVARCHAR(64) NOT NULL,IsSupported BIT NOT NULL,Strategy NVARCHAR(32) NULL,Description NVARCHAR(256));
+INSERT INTO dbo.MigrationScenarioDefinition VALUES
+(1,N'Composite+BranchId IN PK',1,N'Preserve',N'Already branch-unique.'),
+(2,N'Composite+BranchId OUTSIDE PK',1,N'ExpandPK',N'Add BranchId.'),
+(3,N'Composite+NO BranchId',1,N'ExpandPK',N'Inject BranchId.'),
+(4,N'Single Numeric PK Collision',1,N'Rekey',N'Multiplier+Map.'),
+(5,N'GUID PK',1,N'Preserve',N'Globally unique.'),
+(6,N'Natural Key Lookup',1,N'MergeNatural',N'Deduplicate.'),
+(7,N'No PK Heap',1,N'GenerateSurrogate',N'Append+surrogate.'),
+(8,N'Computed PK',0,N'Unsupported',N'Cannot remap.'),
+(9,N'HierarchyId/Spatial/XML PK',0,N'Unsupported',N'Non-standard.'),
+(10,N'Memory-Optimized/Temporal',0,N'Unsupported',N'Specialized.'),
+(11,N'Identity PK No Collision',1,N'Preserve',N'Reseed.'),
+(12,N'Master Reference HO',1,N'MergeToMaster',N'Map via MasterKeyColumn.');
+
+-- ═══ MANUAL CLASSIFICATION OVERRIDE ═══
+IF OBJECT_ID('dbo.ManualClassificationOverride','U') IS NULL
+CREATE TABLE dbo.ManualClassificationOverride(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ForcedCategory NVARCHAR(32) NULL,ForcedStrategy NVARCHAR(32) NULL,ForcedMigrationStrategy NVARCHAR(32) NULL,ForcedUnsupported BIT NULL,Reason NVARCHAR(512) NOT NULL,ApprovedBy NVARCHAR(128) NOT NULL,ApprovedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),ExpiryVersion NVARCHAR(16) NULL,ReviewedBy NVARCHAR(128) NULL,ReviewDate DATETIME2 NULL,IsTemporary BIT NOT NULL DEFAULT 0,CONSTRAINT PK_MCO PRIMARY KEY(SchemaName,TableName));
+GO
+IF NOT EXISTS(SELECT 1 FROM dbo.ManualClassificationOverride WHERE SchemaName=N'dbo' AND TableName=N'genCompanyMaster')
+INSERT INTO dbo.ManualClassificationOverride(SchemaName,TableName,ForcedStrategy,ForcedMigrationStrategy,Reason,ApprovedBy) VALUES(N'dbo',N'genCompanyMaster',N'Preserve',N'Preserve',N'CompanyId is branch identity.',N'System');
+GO
+
+-- ═══ PHASE 1/9: CROSS-DB, DRIFT, GRAPH ═══
+PRINT N'[PHASE 1/9] Cross-DB, Drift, Graph...';
+IF OBJECT_ID('dbo.CrossDatabaseComparison','U') IS NOT NULL DROP TABLE dbo.CrossDatabaseComparison;
+CREATE TABLE dbo.CrossDatabaseComparison(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,RowCountIdentical BIT NULL,RowCountVariance DECIMAL(10,2) NULL,PKRangesOverlap BIT NULL,MaxRowCount BIGINT NULL,MinPK BIGINT NULL,MaxPK BIGINT NULL,DatabaseCount INT NULL,CONSTRAINT PK_CDC PRIMARY KEY(SchemaName,TableName));
+
+IF OBJECT_ID('dbo.DependencyGraph','U') IS NOT NULL DROP TABLE dbo.DependencyGraph;
+CREATE TABLE dbo.DependencyGraph(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,FKDepth INT NULL,ChildCount INT NULL,ParentCount INT NULL,IsHub BIT NULL,IsLeaf BIT NULL,RoughCategory NVARCHAR(32) NULL,TxnChainDepth INT NULL,NeedsReview BIT NULL DEFAULT 0,FKDepthStatus NVARCHAR(32) NULL,CONSTRAINT PK_DG PRIMARY KEY(SchemaName,TableName));
+
+IF OBJECT_ID('dbo.NaturalKeyCandidates','U') IS NOT NULL DROP TABLE dbo.NaturalKeyCandidates;
+CREATE TABLE dbo.NaturalKeyCandidates(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,IndexName SYSNAME NOT NULL,KeyColumns NVARCHAR(MAX) NULL,CandidateRank INT NULL,CONSTRAINT PK_NK PRIMARY KEY(SchemaName,TableName,IndexName));
+GO
+
+DECLARE @TemplateDB SYSNAME=dbo.GetTemplateDB();
+WITH Agg AS(SELECT td.SchemaName,td.TableName,COUNT(DISTINCT td.DatabaseName)AS DBCount,COUNT(DISTINCT td.[RowCount])AS DistinctRC,MAX(td.[RowCount])AS MaxRC,AVG(CAST(td.[RowCount]AS DECIMAL(18,2)))AS AvgRC,STDEV(CAST(td.[RowCount]AS DECIMAL(18,2)))AS StdRC,MIN(ts.MinPK)AS GMinPK,MAX(ts.MinPK)AS GMaxMinPK,MIN(ts.MaxPK)AS GMinMaxPK,MAX(ts.MaxPK)AS GMaxPK FROM dbo.TableDetails td LEFT JOIN dbo.TableStatistics ts ON ts.DatabaseName=td.DatabaseName AND ts.SchemaName=td.SchemaName AND ts.TableName=td.TableName GROUP BY td.SchemaName,td.TableName)
+INSERT INTO dbo.CrossDatabaseComparison SELECT SchemaName,TableName,CASE WHEN DistinctRC=1 THEN 1 ELSE 0 END,CASE WHEN AvgRC>0 THEN CAST(ROUND(StdRC*100.0/AvgRC,2)AS DECIMAL(10,2)) ELSE 0 END,CASE WHEN GMaxMinPK<=GMinMaxPK AND DBCount>1 THEN 1 ELSE 0 END,MaxRC,GMinPK,GMaxPK,DBCount FROM Agg;
+
+INSERT INTO dbo.DependencyGraph(SchemaName,TableName,ParentCount,ChildCount,FKDepthStatus)
+SELECT DISTINCT SchemaName,TableName,
+(SELECT COUNT(*)FROM dbo.TableFKDetails fk WHERE fk.DatabaseName=@TemplateDB AND fk.SchemaName=td.SchemaName AND fk.TableName=td.TableName AND fk.IsSelfReference=0),
+(SELECT COUNT(DISTINCT fk2.TableName)FROM dbo.TableFKDetails fk2 WHERE fk2.DatabaseName=@TemplateDB AND fk2.ReferencedSchema=td.SchemaName AND fk2.ReferencedTable=td.TableName AND fk2.IsSelfReference=0),
+CASE WHEN (SELECT COUNT(*)FROM dbo.TableFKDetails fk WHERE fk.DatabaseName=@TemplateDB AND fk.SchemaName=td.SchemaName AND fk.TableName=td.TableName AND fk.IsSelfReference=0)=0 THEN N'ROOT' ELSE N'PENDING' END
+FROM dbo.TableDetails td WHERE td.DatabaseName=@TemplateDB;
+
+DECLARE @d INT=0,@u INT=1;
+UPDATE dg SET FKDepth=0,FKDepthStatus=N'ROOT' FROM dbo.DependencyGraph dg WHERE ParentCount=0;
+WHILE @u>0 BEGIN
+;WITH Ready AS(
+    SELECT dg.SchemaName,dg.TableName,MAX(p.FKDepth)+1 AS NewDepth
+    FROM dbo.DependencyGraph dg
+    JOIN dbo.TableFKDetails fk ON fk.DatabaseName=@TemplateDB AND fk.SchemaName=dg.SchemaName AND fk.TableName=dg.TableName AND fk.IsSelfReference=0
+    JOIN dbo.DependencyGraph p ON p.SchemaName=fk.ReferencedSchema AND p.TableName=fk.ReferencedTable
+    WHERE dg.FKDepth IS NULL
+    GROUP BY dg.SchemaName,dg.TableName
+    HAVING COUNT(*)=SUM(CASE WHEN p.FKDepth IS NOT NULL THEN 1 ELSE 0 END)
+)
+UPDATE dg SET dg.FKDepth=r.NewDepth,dg.FKDepthStatus=N'RESOLVED'
+FROM dbo.DependencyGraph dg JOIN Ready r ON r.SchemaName=dg.SchemaName AND r.TableName=dg.TableName;
+SET @u=@@ROWCOUNT; SET @d+=1;
+IF @d>1000 BREAK;  -- safety valve against infinite loop on pathological graphs
+END
+UPDATE dg SET FKDepth=900,FKDepthStatus=N'CYCLE',NeedsReview=1 FROM dbo.DependencyGraph dg WHERE FKDepth IS NULL AND ParentCount>0;
+UPDATE dbo.DependencyGraph SET IsHub=CASE WHEN ChildCount>=10 THEN 1 ELSE 0 END,IsLeaf=CASE WHEN ParentCount>0 AND ChildCount=0 THEN 1 ELSE 0 END;
+UPDATE dg SET dg.RoughCategory=CASE WHEN dg.ChildCount>=5 AND dg.ParentCount=0 THEN N'Lookup' WHEN dg.ChildCount>=3 AND dg.ParentCount>=1 THEN N'Master' WHEN dg.ParentCount>=3 AND dg.ChildCount>=1 THEN N'TransactionHeader' WHEN dg.ParentCount>=1 AND dg.ChildCount=0 THEN N'TransactionDetail' ELSE N'Unknown' END FROM dbo.DependencyGraph dg;
+UPDATE dbo.DependencyGraph SET TxnChainDepth=0 WHERE RoughCategory IN(N'Lookup',N'Master');
+DECLARE @cd INT=0,@cu INT=1;
+WHILE @cu>0 BEGIN UPDATE dg SET dg.TxnChainDepth=@cd+1 FROM dbo.DependencyGraph dg WHERE dg.TxnChainDepth IS NULL AND dg.RoughCategory IN(N'TransactionHeader',N'TransactionDetail') AND EXISTS(SELECT 1 FROM dbo.TableFKDetails fk JOIN dbo.DependencyGraph p ON p.SchemaName=fk.ReferencedSchema AND p.TableName=fk.ReferencedTable WHERE fk.DatabaseName=@TemplateDB AND fk.SchemaName=dg.SchemaName AND fk.TableName=dg.TableName AND fk.IsSelfReference=0 AND p.TxnChainDepth=@cd); SET @cu=@@ROWCOUNT; SET @cd+=1; END
+UPDATE dbo.DependencyGraph SET TxnChainDepth=99 WHERE TxnChainDepth IS NULL;
+-- FIX: cycle/unresolved rows already got FKDepth=900 above; anything still NULL here has ParentCount=0 miscounted or is truly isolated -- treat as CYCLE (900), NOT as ROOT (0), to avoid masking topology violations
+UPDATE dbo.DependencyGraph SET FKDepth=900,FKDepthStatus=N'UNKNOWN',NeedsReview=1 WHERE FKDepth IS NULL;
+
+INSERT INTO dbo.NaturalKeyCandidates(SchemaName,TableName,IndexName,KeyColumns) SELECT SchemaName,TableName,IndexName,KeyColumns FROM dbo.TableIndexes WHERE IsUnique=1 AND IsPrimaryKey=0 AND DatabaseName=@TemplateDB;
+WITH Ranked AS(SELECT SchemaName,TableName,IndexName,ROW_NUMBER()OVER(PARTITION BY SchemaName,TableName ORDER BY LEN(KeyColumns)-LEN(REPLACE(KeyColumns,N',',N'')))AS rnk FROM dbo.NaturalKeyCandidates) UPDATE nk SET nk.CandidateRank=r.rnk FROM dbo.NaturalKeyCandidates nk JOIN Ranked r ON r.SchemaName=nk.SchemaName AND r.TableName=nk.TableName AND r.IndexName=nk.IndexName;
+GO
+
+-- ═══ PHASE 1B/9: VOCABULARIES ═══
+PRINT N'[PHASE 1B/9] Vocabularies...';
+IF OBJECT_ID('dbo.SemanticVocabulary','U') IS NOT NULL DROP TABLE dbo.SemanticVocabulary;
+CREATE TABLE dbo.SemanticVocabulary(VocabId INT IDENTITY PRIMARY KEY,Category NVARCHAR(32) NOT NULL,Term NVARCHAR(64) NOT NULL,BaseWeight INT NOT NULL,IsGeneric BIT NOT NULL DEFAULT 0,ContextBoostCategory NVARCHAR(32) NULL,ContextBoostWeight INT NULL);
+INSERT INTO dbo.SemanticVocabulary VALUES
+(N'Generic',N'Detail',5,1,N'TransactionDetail',30),(N'Generic',N'Allocate',8,1,N'TransactionDetail',25),(N'Generic',N'Commission',8,1,N'TransactionDetail',25),(N'Generic',N'Activity',5,1,N'Audit',15),(N'Generic',N'Login',5,1,N'Audit',15),(N'Generic',N'History',5,1,N'Audit',15),(N'Generic',N'Log',5,1,N'Audit',15),(N'Generic',N'Tracking',5,1,N'Audit',15),(N'Generic',N'Trace',5,1,N'Audit',15),(N'Generic',N'Setting',5,1,N'Configuration',20),(N'Generic',N'Profile',5,1,N'Configuration',20),(N'Generic',N'Option',5,1,N'Configuration',20),(N'Generic',N'Preference',5,1,N'Configuration',20),
+(N'Lookup',N'Country',10,0,NULL,NULL),(N'Lookup',N'Currency',10,0,NULL,NULL),(N'Lookup',N'Mode',10,0,NULL,NULL),(N'Lookup',N'Status',10,0,NULL,NULL),(N'Lookup',N'Type',8,0,NULL,NULL),(N'Lookup',N'Reason',10,0,NULL,NULL),(N'Lookup',N'Class',8,0,NULL,NULL),(N'Lookup',N'Category',8,0,NULL,NULL),(N'Lookup',N'Color',10,0,NULL,NULL),(N'Lookup',N'Unit',10,0,NULL,NULL),(N'Lookup',N'Language',10,0,NULL,NULL),
+(N'Master',N'Customer',10,0,NULL,NULL),(N'Master',N'Vendor',10,0,NULL,NULL),(N'Master',N'Employee',10,0,NULL,NULL),(N'Master',N'Employees',25,0,NULL,NULL),(N'Master',N'Party',10,0,NULL,NULL),(N'Master',N'Company',10,0,NULL,NULL),(N'Master',N'Supplier',20,0,NULL,NULL),(N'Master',N'Carrier',22,0,NULL,NULL),(N'Master',N'Warehouse',10,0,NULL,NULL),(N'Master',N'Branch',8,0,NULL,NULL),(N'Master',N'Vehicle',10,0,NULL,NULL),(N'Master',N'Partner',18,0,NULL,NULL),(N'Master',N'Emp',15,0,NULL,NULL),(N'Master',N'Cust',15,0,NULL,NULL),(N'Master',N'Vend',15,0,NULL,NULL),(N'Master',N'Agt',12,0,NULL,NULL),(N'Master',N'Co',10,0,NULL,NULL),
+(N'TransactionHeader',N'Invoice',10,0,NULL,NULL),(N'TransactionHeader',N'Order',10,0,NULL,NULL),(N'TransactionHeader',N'Shipment',10,0,NULL,NULL),(N'TransactionHeader',N'Manifest',10,0,NULL,NULL),(N'TransactionHeader',N'Job',8,0,NULL,NULL),(N'TransactionHeader',N'Booking',10,0,NULL,NULL),(N'TransactionHeader',N'Quotation',10,0,NULL,NULL),(N'TransactionHeader',N'Payment',8,0,NULL,NULL),(N'TransactionHeader',N'Receipt',8,0,NULL,NULL),
+(N'TransactionDetail',N'Item',8,0,NULL,NULL),(N'TransactionDetail',N'Line',10,0,NULL,NULL),(N'TransactionDetail',N'Commodity',10,0,NULL,NULL),(N'TransactionDetail',N'Charges',10,0,NULL,NULL),(N'TransactionDetail',N'Container',10,0,NULL,NULL),(N'TransactionDetail',N'Tax',8,0,NULL,NULL),(N'TransactionDetail',N'Expense',8,0,NULL,NULL),(N'TransactionDetail',N'Allocation',12,0,NULL,NULL),(N'TransactionDetail',N'Assignment',10,0,NULL,NULL),
+(N'Configuration',N'Configuration',10,0,NULL,NULL),(N'Configuration',N'Parameter',10,0,NULL,NULL);
+
+IF OBJECT_ID('dbo.BusinessOwnerVocabulary','U') IS NOT NULL DROP TABLE dbo.BusinessOwnerVocabulary;
+CREATE TABLE dbo.BusinessOwnerVocabulary(VocabId INT IDENTITY PRIMARY KEY,OwnerType NVARCHAR(16) NOT NULL,ColumnPattern NVARCHAR(128) NOT NULL,MatchType NVARCHAR(16) NOT NULL,Priority INT NOT NULL);
+INSERT INTO dbo.BusinessOwnerVocabulary VALUES
+(N'HO',N'HO%ID',N'PREFIX',100),(N'HO',N'HO%Code',N'PREFIX',95),(N'HO',N'HO%No',N'PREFIX',95),(N'HO',N'HO%Ref',N'PREFIX',90),(N'HO',N'HO%',N'PREFIX',85),
+(N'Region',N'BranchId',N'EXACT',80),(N'Region',N'BranchID',N'EXACT',80),(N'Region',N'RegionId',N'EXACT',75),(N'Region',N'RegionID',N'EXACT',75),(N'Region',N'DivisionId',N'SUFFIX',70),(N'Region',N'OfficeId',N'SUFFIX',65),(N'Region',N'DeptId',N'SUFFIX',60),(N'Region',N'SalesmanId',N'SUFFIX',55),(N'Region',N'RepresentativeId',N'SUFFIX',50),(N'Region',N'AgentCode',N'SUFFIX',45),(N'Region',N'WarehouseCode',N'SUFFIX',45),(N'Region',N'CompanyCode',N'SUFFIX',40);
+
+IF OBJECT_ID('dbo.BusinessOwnerOverride','U') IS NULL
+CREATE TABLE dbo.BusinessOwnerOverride(OverrideId INT IDENTITY PRIMARY KEY,DatabaseName SYSNAME NULL,DatabaseRole NVARCHAR(16) NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ColumnPattern NVARCHAR(128) NOT NULL,OwnerType NVARCHAR(16) NOT NULL,MatchType NVARCHAR(16) NOT NULL DEFAULT N'EXACT',Priority INT NOT NULL DEFAULT 50,Reason NVARCHAR(512) NULL,CreatedBy NVARCHAR(128) NOT NULL DEFAULT N'System',CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT UQ_BOO UNIQUE(DatabaseName,SchemaName,TableName,ColumnPattern,OwnerType));
+
+IF OBJECT_ID('dbo.EvidenceWeightConfig','U') IS NOT NULL DROP TABLE dbo.EvidenceWeightConfig;
+CREATE TABLE dbo.EvidenceWeightConfig(ConfigId INT IDENTITY PRIMARY KEY,WeightVersion NVARCHAR(16) NOT NULL DEFAULT N'V1.0',CustomerName NVARCHAR(128) NULL,SignalName NVARCHAR(64) NOT NULL,Category NVARCHAR(32) NOT NULL,MatchType CHAR(6) NOT NULL,MatchValue NVARCHAR(64) NULL,MinValue FLOAT NULL,MaxValue FLOAT NULL,Weight INT NOT NULL,Reason NVARCHAR(128) NULL,IsActive BIT NOT NULL DEFAULT 1,EffectiveFrom DATETIME2 NULL,EffectiveTo DATETIME2 NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+INSERT INTO dbo.EvidenceWeightConfig(SignalName,Category,MatchType,MatchValue,MinValue,MaxValue,Weight,Reason) VALUES
+(N'RowCountIdentical',N'Lookup','EQ',N'1',NULL,NULL,30,N'Same row count'),(N'NaturalKeyCount',N'Lookup','GT',NULL,0,NULL,25,N'Natural key'),(N'IncomingFK',N'Lookup','GT',NULL,10,NULL,20,N'Many refs'),(N'NoBranchId',N'Lookup','EQ',N'1',NULL,NULL,15,N'No branch'),(N'BranchId',N'Lookup','EQ',N'1',NULL,NULL,-15,N'Has BranchId'),(N'NameGen',N'Lookup','EQ',N'1',NULL,NULL,8,N'gen*'),(N'BranchId',N'Master','EQ',N'1',NULL,NULL,25,N'Has BranchId'),(N'IsHub',N'Master','EQ',N'1',NULL,NULL,20,N'High children'),(N'NameMaster',N'Master','EQ',N'1',NULL,NULL,8,N'Master pattern'),(N'BranchId',N'TransactionHeader','EQ',N'1',NULL,NULL,20,N'Has BranchId'),(N'HasDateRange',N'TransactionHeader','EQ',N'1',NULL,NULL,10,N'Has CreatedDate'),(N'OutgoingFK',N'TransactionDetail','EQ',N'1',NULL,NULL,30,N'Points to header'),(N'RowCountIdentical',N'Configuration','EQ',N'1',NULL,NULL,25,N'Same rows'),(N'NoBranchId',N'Configuration','EQ',N'1',NULL,NULL,20,N'No branch'),(N'HasNaturalKeyCandidate',N'Lookup','EQ',N'1',NULL,NULL,20,N'Natural key exists'),(N'SemScoreLookup',N'Lookup','GT',NULL,0,NULL,25,N'Lookup term'),(N'SemScoreMaster',N'Master','GT',NULL,0,NULL,25,N'Master term'),(N'SemScoreHeader',N'TransactionHeader','GT',NULL,0,NULL,25,N'Header term'),(N'SemScoreDetail',N'TransactionDetail','GT',NULL,0,NULL,25,N'Detail term'),(N'SemScoreConfig',N'Configuration','GT',NULL,0,NULL,25,N'Config term'),(N'NoBusinessDate',N'Lookup','EQ',N'1',NULL,NULL,10,N'No biz dates'),(N'HasApprovalWorkflow',N'Lookup','EQ',N'1',NULL,NULL,-20,N'Has approval'),(N'HasLifecycleDates',N'Lookup','EQ',N'1',NULL,NULL,-10,N'Has lifecycle'),(N'HasBusinessDate',N'TransactionHeader','EQ',N'1',NULL,NULL,20,N'Has biz date'),(N'HasApprovalWorkflow',N'TransactionHeader','EQ',N'1',NULL,NULL,15,N'Has approval'),(N'HasLifecycleDates',N'Master','EQ',N'1',NULL,NULL,10,N'Has lifecycle'),(N'HasMoneyColumns',N'TransactionDetail','EQ',N'1',NULL,NULL,25,N'Has money'),(N'HasMoneyColumns',N'TransactionHeader','EQ',N'1',NULL,NULL,15,N'Has money'),(N'HasMoneyColumns',N'Lookup','EQ',N'1',NULL,NULL,-25,N'Money disqualifies'),(N'HasDocumentColumns',N'Lookup','EQ',N'1',NULL,NULL,-15,N'Doc disqualifies'),(N'HasDocumentColumns',N'TransactionDetail','EQ',N'1',NULL,NULL,10,N'Has doc'),(N'IsNarrowTable',N'Lookup','EQ',N'1',NULL,NULL,10,N'Narrow'),(N'IsWideTable',N'Lookup','EQ',N'1',NULL,NULL,-15,N'Wide disqualifies'),(N'IsWideTable',N'Master','EQ',N'1',NULL,NULL,10,N'Wide ok'),(N'NumericHeavy',N'TransactionDetail','EQ',N'1',NULL,NULL,10,N'Numeric'),(N'HasMasterKey',N'Master','EQ',N'1',NULL,NULL,80,N'Master key'),(N'MasterPatternCount',N'Master','GT',NULL,0,NULL,60,N'Pattern match'),(N'MasterConfidence',N'Master','GT',NULL,80,NULL,50,N'High confidence'),(N'ReferenceOwnerCount',N'Master','GT',NULL,0,NULL,40,N'HO refs'),(N'HasHOOwnerPattern',N'Master','EQ',N'1',NULL,NULL,35,N'HO owner'),(N'HasMasterKey',N'Lookup','EQ',N'1',NULL,NULL,-30,N'Key disqualifies'),(N'HasMasterKey',N'TransactionHeader','EQ',N'1',NULL,NULL,-20,N'Key disqualifies'),(N'HasMasterKey',N'TransactionDetail','EQ',N'1',NULL,NULL,-30,N'Key disqualifies'),(N'NameDetail',N'TransactionDetail','EQ',N'1',NULL,NULL,40,N'Detail name'),(N'HasDetailChild',N'TransactionDetail','EQ',N'1',NULL,NULL,-20,N'Children disqualify'),(N'IsMergeToMasterEligible',N'_Strategy','EQ',N'1',NULL,NULL,200,N'MTM eligible'),(N'NameEntity',N'Master','EQ',N'1',NULL,NULL,30,N'Table contains recognized entity name'),(N'HasEntityID',N'Master','EQ',N'1',NULL,NULL,40,N'Has entity ID column'),(N'HasHOEntityID',N'Master','EQ',N'1',NULL,NULL,80,N'Has HO entity ID column'),(N'IdentityEntity',N'Master','EQ',N'1',NULL,NULL,50,N'IdentityPlan entity recognized');
+GO
+
+
+
+-- ═══ PHASE 2/9: EVIDENCE LAYER ════════════════════════════════════
+PRINT N'[PHASE 2/9] Evidence Layer...';
+DECLARE @TemplateDB SYSNAME=dbo.GetTemplateDB();
+DECLARE @MasterSourceDB SYSNAME=dbo.GetMasterSourceDB();
+IF OBJECT_ID('dbo.TableEvidence','U') IS NOT NULL DROP TABLE dbo.TableEvidence;
+CREATE TABLE dbo.TableEvidence(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,SignalName NVARCHAR(64) NOT NULL,SignalType CHAR(1) NOT NULL,BooleanValue BIT NULL,IntegerValue INT NULL,DecimalValue DECIMAL(18,4) NULL,StringValue NVARCHAR(256) NULL,CONSTRAINT PK_TE PRIMARY KEY(SchemaName,TableName,SignalName));
+
+-- ═══ SIMPLIFIED TABLEEVIDENCE INSERT ═══
+INSERT INTO dbo.TableEvidence(SchemaName, TableName, SignalName, SignalType, BooleanValue, IntegerValue, StringValue)
+SELECT td.SchemaName, td.TableName, N'BranchId', 'B', td.HasBranchId, NULL, NULL
+FROM dbo.TableDetails td WHERE td.DatabaseName = @TemplateDB
+UNION ALL
+SELECT td.SchemaName, td.TableName, N'Identity', 'B', td.HasIdentity, NULL, NULL
+FROM dbo.TableDetails td WHERE td.DatabaseName = @TemplateDB
+UNION ALL
+SELECT td.SchemaName, td.TableName, N'NoBranchId', 'B', 
+       CASE WHEN ISNULL(td.HasBranchId, 0) = 0 THEN 1 ELSE 0 END, NULL, NULL
+FROM dbo.TableDetails td WHERE td.DatabaseName = @TemplateDB
+UNION ALL
+SELECT td.SchemaName, td.TableName, N'GuidPK', 'B', td.IsGuidPK, NULL, NULL
+FROM dbo.TableDetails td WHERE td.DatabaseName = @TemplateDB
+UNION ALL
+SELECT td.SchemaName, td.TableName, N'CompositePK', 'B', td.CompositePK, NULL, NULL
+FROM dbo.TableDetails td WHERE td.DatabaseName = @TemplateDB;
+
+INSERT INTO dbo.TableEvidence(SchemaName, TableName, SignalName, SignalType, IntegerValue)
+SELECT SchemaName, TableName, N'IncomingFK', 'I', ChildCount
+FROM dbo.DependencyGraph WHERE ChildCount > 0
+UNION ALL
+SELECT SchemaName, TableName, N'OutgoingFK', 'I', ParentCount
+FROM dbo.DependencyGraph WHERE ParentCount > 0
+UNION ALL
+SELECT SchemaName, TableName, N'FKDepth', 'I', FKDepth
+FROM dbo.DependencyGraph
+UNION ALL
+SELECT SchemaName, TableName, N'TxnChainDepth', 'I', TxnChainDepth
+FROM dbo.DependencyGraph;
+
+INSERT INTO dbo.TableEvidence(SchemaName, TableName, SignalName, SignalType, BooleanValue)
+SELECT SchemaName, TableName, N'ExistsInHO', 'B', 
+       CASE WHEN EXISTS (SELECT 1 FROM dbo.TableDetails td2 
+                         WHERE td2.DatabaseName = @MasterSourceDB 
+                           AND td2.SchemaName = td.SchemaName 
+                           AND td2.TableName = td.TableName) THEN 1 ELSE 0 END
+FROM dbo.TableDetails td WHERE td.DatabaseName = @TemplateDB
+UNION ALL
+SELECT SchemaName, TableName, N'ExistsInRegion', 'B',
+       CASE WHEN EXISTS (SELECT 1 FROM dbo.TableDetails td3 
+                         JOIN dbo.DiscoveryConfig dc ON td3.DatabaseName = dc.DBName 
+                         WHERE td3.DatabaseName NOT IN (@MasterSourceDB, @TemplateDB) 
+                           AND dc.DatabaseRole = N'Region'
+                           AND td3.SchemaName = td.SchemaName 
+                           AND td3.TableName = td.TableName) THEN 1 ELSE 0 END
+FROM dbo.TableDetails td WHERE td.DatabaseName = @TemplateDB;
+
+INSERT INTO dbo.TableEvidence(SchemaName, TableName, SignalName, SignalType, BooleanValue)
+SELECT SchemaName, TableName, N'NameGen', 'B',
+       CASE WHEN TableName LIKE N'gen%' OR TableName LIKE N'%Type%' OR TableName LIKE N'%Status%' 
+            THEN 1 ELSE 0 END
+FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB
+UNION ALL
+SELECT SchemaName, TableName, N'NameMaster', 'B',
+       CASE WHEN TableName LIKE N'%Master%' OR TableName LIKE N'%Customer%' OR TableName LIKE N'%Account%' 
+            THEN 1 ELSE 0 END
+FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB
+UNION ALL
+SELECT SchemaName, TableName, N'NameDetail', 'B',
+       CASE WHEN TableName LIKE N'%Detail%' OR TableName LIKE N'%Line%' 
+            THEN 1 ELSE 0 END
+FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB;
+PRINT N'[PHASE 2/9] Complete.';
+GO
+-- ═══ PHASE 2.ID: IDENTITY PLAN ═══════════════════════════════════
+PRINT N'[PHASE 2.ID] Identity Ownership Model...';
+DECLARE @TemplateDB SYSNAME=dbo.GetTemplateDB();
+DECLARE @MasterSourceDB SYSNAME=dbo.GetMasterSourceDB();
+IF OBJECT_ID('tempdb..#IP_PK')IS NOT NULL DROP TABLE #IP_PK;
+SELECT pk.SchemaName,pk.TableName,pk.ColumnName AS PKCol,pk.Ordinal AS PKOrd,tc.ReferenceOwner AS PKRefOwner,tc.DataType AS PKDataType,tc.IsIdentity,CASE WHEN pk.ColumnName IN(N'BranchId',N'BranchID',N'RegionId',N'RegionID')THEN 1 ELSE 0 END AS IsBranchCol INTO #IP_PK FROM dbo.TablePKColumns pk JOIN dbo.TableColumns tc ON tc.DatabaseName=pk.DatabaseName AND tc.SchemaName=pk.SchemaName AND tc.TableName=pk.TableName AND tc.ColumnName=pk.ColumnName WHERE pk.DatabaseName=@TemplateDB;
+IF OBJECT_ID('tempdb..#IP_IDCOL')IS NOT NULL DROP TABLE #IP_IDCOL;
+SELECT SchemaName,TableName,[IdentityCol],IdentityColOwner,PKDataType,IsIdentity INTO #IP_IDCOL FROM(SELECT SchemaName,TableName,PKCol AS [IdentityCol],PKRefOwner AS IdentityColOwner,PKDataType,IsIdentity,ROW_NUMBER()OVER(PARTITION BY SchemaName,TableName ORDER BY IsBranchCol ASC,CASE PKRefOwner WHEN N'HO' THEN 1 WHEN N'Region' THEN 2 ELSE 3 END,PKOrd)AS rn FROM #IP_PK)x WHERE rn=1;
+IF OBJECT_ID('tempdb..#IP_HO')IS NOT NULL DROP TABLE #IP_HO;
+SELECT SchemaName,TableName,HOColCnt,BestHOEntity,HOColIsPK,HOColIsUnique,HOBestCol INTO #IP_HO FROM(SELECT tc.SchemaName,tc.TableName,COUNT(*)OVER(PARTITION BY tc.SchemaName,tc.TableName)AS HOColCnt,mv.MasterEntity AS BestHOEntity,CASE WHEN pk2.Ordinal=1 THEN 1 ELSE 0 END AS HOColIsPK,CASE WHEN EXISTS(SELECT 1 FROM dbo.TableIndexes ti WHERE ti.DatabaseName=@TemplateDB AND ti.SchemaName=tc.SchemaName AND ti.TableName=tc.TableName AND ti.IsUnique=1 AND ti.IsPrimaryKey=0 AND(ti.KeyColumns=QUOTENAME(tc.ColumnName)OR ti.KeyColumns LIKE N'['+tc.ColumnName+N'],%' OR ti.KeyColumns LIKE N'%, ['+tc.ColumnName+N']%'))THEN 1 ELSE 0 END AS HOColIsUnique,tc.ColumnName AS HOBestCol,ROW_NUMBER()OVER(PARTITION BY tc.SchemaName,tc.TableName ORDER BY ISNULL(mv.Priority,0)DESC,CASE WHEN pk2.Ordinal=1 THEN 1 ELSE 0 END DESC)AS rn FROM dbo.TableColumns tc LEFT JOIN dbo.MasterEntityVocabulary mv ON(mv.MatchType=N'EXACT' AND tc.ColumnName=mv.ColumnPattern)OR(mv.MatchType=N'SUFFIX' AND tc.ColumnName LIKE N'%'+mv.ColumnPattern)OR(mv.MatchType=N'PREFIX' AND tc.ColumnName LIKE mv.ColumnPattern+N'%') LEFT JOIN dbo.TablePKColumns pk2 ON pk2.DatabaseName=@TemplateDB AND pk2.SchemaName=tc.SchemaName AND pk2.TableName=tc.TableName AND pk2.ColumnName=tc.ColumnName AND pk2.Ordinal=1 WHERE tc.DatabaseName=@TemplateDB AND tc.ReferenceOwner=N'HO')x WHERE rn=1;
+IF OBJECT_ID('tempdb..#IP_ROC')IS NOT NULL DROP TABLE #IP_ROC;
+SELECT SchemaName,TableName,SUM(CASE WHEN ReferenceOwner=N'HO' THEN 1 ELSE 0 END)AS HOCnt,SUM(CASE WHEN ReferenceOwner=N'Region' THEN 1 ELSE 0 END)AS RegionCnt INTO #IP_ROC FROM dbo.TableColumns WHERE DatabaseName=@TemplateDB AND ReferenceOwner IS NOT NULL GROUP BY SchemaName,TableName;
+IF OBJECT_ID('tempdb..#IP_EX')IS NOT NULL DROP TABLE #IP_EX;
+SELECT SchemaName,TableName,MAX(CASE WHEN dc.DatabaseRole=N'HO' THEN 1 ELSE 0 END)AS InHO,MAX(CASE WHEN dc.DatabaseRole=N'Region' THEN 1 ELSE 0 END)AS InRegion,COUNT(DISTINCT CASE WHEN dc.DatabaseRole=N'Region' THEN dc.DBName END)AS RegionDBCount INTO #IP_EX FROM dbo.TableDetails td JOIN dbo.DiscoveryConfig dc ON dc.DBName=td.DatabaseName AND dc.IsActive=1 AND dc.DatabaseRole IN(N'HO',N'Region') GROUP BY SchemaName,TableName;
+IF OBJECT_ID('tempdb..#IP_ENT')IS NOT NULL DROP TABLE #IP_ENT;
+SELECT SchemaName,TableName,MasterEntity,Priority,BaseConfidence INTO #IP_ENT FROM(SELECT ic.SchemaName,ic.TableName,mv.MasterEntity,mv.Priority,mv.BaseConfidence,ROW_NUMBER()OVER(PARTITION BY ic.SchemaName,ic.TableName ORDER BY mv.BaseConfidence+mv.Priority DESC)AS rn FROM #IP_IDCOL ic JOIN dbo.MasterEntityVocabulary mv ON(mv.MatchType=N'EXACT' AND ic.[IdentityCol]=mv.ColumnPattern)OR(mv.MatchType=N'SUFFIX' AND ic.[IdentityCol] LIKE N'%'+mv.ColumnPattern)OR(mv.MatchType=N'PREFIX' AND ic.[IdentityCol] LIKE mv.ColumnPattern+N'%'))x WHERE rn=1;
+IF OBJECT_ID('tempdb..#IP_HOENT')IS NOT NULL DROP TABLE #IP_HOENT;
+SELECT SchemaName,TableName,BestHOEntity AS Entity INTO #IP_HOENT FROM #IP_HO WHERE BestHOEntity IS NOT NULL;
+IF OBJECT_ID('tempdb..#IP_FKIN')IS NOT NULL DROP TABLE #IP_FKIN;
+SELECT ReferencedSchema AS Sch,ReferencedTable AS Tbl,COUNT(*)AS Cnt INTO #IP_FKIN FROM dbo.TableFKDetails WHERE DatabaseName=@TemplateDB AND IsSelfReference=0 GROUP BY ReferencedSchema,ReferencedTable;
+IF OBJECT_ID('tempdb..#IP_VFKIN') IS NOT NULL DROP TABLE #IP_VFKIN;
+DECLARE @MinCoveragePct DECIMAL(9,4) = CAST(ISNULL((SELECT ParamValue FROM dbo.DiscoveryParameters WHERE ParamName = N'VirtualFK_MinCoveragePct'), N'90.0000') AS DECIMAL(9,4));
+SELECT ReferencedSchema AS Sch, ReferencedTable AS Tbl, COUNT(*) AS Cnt INTO #IP_VFKIN FROM dbo.ColumnRelationshipEvidence v WHERE v.DatabaseName = @TemplateDB AND v.MatchCoveragePct >= @MinCoveragePct AND NOT EXISTS (SELECT 1 FROM dbo.TableFKDetails fk WHERE fk.DatabaseName = @TemplateDB AND fk.SchemaName = v.SchemaName AND fk.TableName = v.TableName AND fk.FKColumns = v.FKColumn AND fk.ReferencedSchema = v.ReferencedSchema AND fk.ReferencedTable = v.ReferencedTable) GROUP BY ReferencedSchema, ReferencedTable;
+IF OBJECT_ID('tempdb..#IP_FKOUT')IS NOT NULL DROP TABLE #IP_FKOUT;
+SELECT SchemaName AS Sch,TableName AS Tbl,COUNT(*)AS Cnt INTO #IP_FKOUT FROM dbo.TableFKDetails WHERE DatabaseName=@TemplateDB AND IsSelfReference=0 GROUP BY SchemaName,TableName;
+IF OBJECT_ID('tempdb..#IP_BIZREF')IS NOT NULL DROP TABLE #IP_BIZREF;
+SELECT mv.MasterEntity,COUNT(DISTINCT tc.SchemaName+N'.'+tc.TableName+N'.'+tc.ColumnName)AS Cnt INTO #IP_BIZREF FROM dbo.MasterEntityVocabulary mv JOIN dbo.TableColumns tc ON tc.DatabaseName=@TemplateDB AND((mv.MatchType=N'EXACT' AND tc.ColumnName=mv.ColumnPattern)OR(mv.MatchType=N'SUFFIX' AND tc.ColumnName LIKE N'%'+mv.ColumnPattern)OR(mv.MatchType=N'PREFIX' AND tc.ColumnName LIKE mv.ColumnPattern+N'%')) LEFT JOIN dbo.TablePKColumns pk ON pk.DatabaseName=@TemplateDB AND pk.SchemaName=tc.SchemaName AND pk.TableName=tc.TableName AND pk.ColumnName=tc.ColumnName AND pk.Ordinal=1 WHERE pk.ColumnName IS NULL GROUP BY mv.MasterEntity;
+IF OBJECT_ID('tempdb..#IP_CRE')IS NOT NULL DROP TABLE #IP_CRE;
+CREATE TABLE #IP_CRE(Sch SYSNAME,Tbl SYSNAME,Cnt INT);
+IF OBJECT_ID('tempdb..#IP_UNQ')IS NOT NULL DROP TABLE #IP_UNQ;
+SELECT SchemaName,TableName,KeyColumns INTO #IP_UNQ FROM dbo.TableIndexes WHERE DatabaseName=@TemplateDB AND IsUnique=1 AND IsPrimaryKey=0;
+IF OBJECT_ID('tempdb..#IP_CC')IS NOT NULL DROP TABLE #IP_CC;
+SELECT SchemaName,TableName,COUNT(*)AS TotalCols,SUM(CASE WHEN ColumnName LIKE N'Created%' OR ColumnName LIKE N'Modified%' OR ColumnName LIKE N'Updated%' THEN 1 ELSE 0 END)AS AuditCols INTO #IP_CC FROM dbo.TableColumns WHERE DatabaseName=@TemplateDB GROUP BY SchemaName,TableName;
+IF OBJECT_ID('tempdb..#IP_PC')IS NOT NULL DROP TABLE #IP_PC;
+SELECT SchemaName,TableName,COUNT(*)AS PKCols INTO #IP_PC FROM dbo.TablePKColumns WHERE DatabaseName=@TemplateDB GROUP BY SchemaName,TableName;
+IF OBJECT_ID('tempdb..#IP_BO')IS NOT NULL DROP TABLE #IP_BO;
+SELECT SchemaName,TableName,MAX(CASE WHEN OwnerSignal=N'HO' THEN 1 ELSE 0 END)AS HasHOSignal,MAX(CASE WHEN OwnerSignal=N'Region' THEN 1 ELSE 0 END)AS HasRegionSignal INTO #IP_BO FROM(SELECT tc.SchemaName,tc.TableName,bo.OwnerType AS OwnerSignal FROM dbo.TableColumns tc JOIN dbo.BusinessOwnerVocabulary bo ON(bo.MatchType=N'EXACT' AND tc.ColumnName=bo.ColumnPattern)OR(bo.MatchType=N'PREFIX' AND tc.ColumnName LIKE bo.ColumnPattern+N'%')OR(bo.MatchType=N'SUFFIX' AND tc.ColumnName LIKE N'%'+bo.ColumnPattern) WHERE tc.DatabaseName=@TemplateDB UNION SELECT tc.SchemaName,tc.TableName,tc.ReferenceOwner FROM dbo.TableColumns tc WHERE tc.DatabaseName=@TemplateDB AND tc.ReferenceOwner IS NOT NULL)x GROUP BY SchemaName,TableName;
+IF OBJECT_ID('dbo.IdentityPlan','U') IS NOT NULL DROP TABLE dbo.IdentityPlan;
+CREATE TABLE dbo.IdentityPlan(
+SchemaName SYSNAME NOT NULL, TableName SYSNAME NOT NULL,
+IdentityOwner NVARCHAR(32) NOT NULL, IdentityOwnerColumn NVARCHAR(256) NULL,
+OwnershipRule NVARCHAR(32) NOT NULL, ReasonCode NVARCHAR(64) NOT NULL,
+ReasonText NVARCHAR(512) NOT NULL,
+IdentityAuthority NVARCHAR(32) NOT NULL, IdentityType NVARCHAR(32) NOT NULL,
+IdentityEntity NVARCHAR(64) NULL, IdentityResolution NVARCHAR(32) NOT NULL,
+HOColumnCount INT NOT NULL DEFAULT 0, RegionColumnCount INT NOT NULL DEFAULT 0,
+ExistsInHO BIT NULL, ExistsInRegion BIT NULL, RegionDatabaseCount INT NOT NULL DEFAULT 0,
+HasMasterKey BIT NOT NULL DEFAULT 0, MasterKeyColumn NVARCHAR(256) NULL,
+IncomingDeclaredFKs INT NOT NULL DEFAULT 0, IncomingVirtualFKs INT NOT NULL DEFAULT 0,
+IncomingColumnRels INT NOT NULL DEFAULT 0, OutgoingDeclaredFKs INT NOT NULL DEFAULT 0,
+BusinessReferenceCols INT NOT NULL DEFAULT 0, TotalIncomingRefs INT NOT NULL DEFAULT 0,
+IdentityParent SYSNAME NULL, IdentityChild SYSNAME NULL,
+RelationshipType NVARCHAR(32) NULL, RelationshipCardinality NVARCHAR(8) NULL,
+ChildAttributeCount INT NULL, IdentityAnchor BIT NOT NULL DEFAULT 0,
+ConfidenceScore DECIMAL(5,2) NULL, ClassificationTier NVARCHAR(16) NULL,
+EvidenceCount INT NULL, EvidenceBreadth INT NULL,
+TopPositiveKey NVARCHAR(64) NULL, TopNegativeKey NVARCHAR(64) NULL,
+NetScore DECIMAL(9,2) NULL, PositiveScore DECIMAL(9,2) NULL, NegativeScore DECIMAL(9,2) NULL,
+V10Winner NVARCHAR(32) NULL,
+CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+CONSTRAINT PK_IdentityPlan PRIMARY KEY (SchemaName, TableName));
+-- Pass 1: Identity ownership
+INSERT INTO dbo.IdentityPlan(SchemaName,TableName,IdentityOwnerColumn,IdentityOwner,OwnershipRule,ReasonCode,ReasonText,IdentityAuthority,IdentityType,IdentityResolution,HOColumnCount,RegionColumnCount,ExistsInHO,ExistsInRegion,RegionDatabaseCount,HasMasterKey,MasterKeyColumn)
+SELECT td.SchemaName,td.TableName,idc.[IdentityCol],
+CASE WHEN idc.IdentityColOwner=N'HO' THEN N'HO' WHEN ho.HOColCnt>0 AND(ho.HOColIsPK=1 OR ho.HOColIsUnique=1)THEN N'HO' WHEN idc.IdentityColOwner=N'Region' THEN N'Region' WHEN td.CompositePK=1 AND td.HasBranchId=1 THEN N'Composite' WHEN ISNULL(ex.InHO,0)=1 AND ISNULL(ex.InRegion,0)=0 THEN N'HO' WHEN ISNULL(ex.InHO,0)=0 AND ISNULL(ex.InRegion,0)=1 THEN N'Region' WHEN ISNULL(idc.IdentityColOwner,N'')NOT IN(N'HO',N'Region')AND ISNULL(ho.HOColCnt,0)=0 AND ISNULL(bo.HasHOSignal,0)=0 AND ISNULL(bo.HasRegionSignal,0)=0 AND ISNULL(ex.InHO,0)+ISNULL(ex.InRegion,0)>=1 AND idc.PKDataType IN(N'varchar',N'nvarchar',N'char',N'nchar')THEN N'Shared' WHEN td.HasIdentity=1 AND idc.IdentityColOwner IS NULL AND ISNULL(ho.HOColCnt,0)=0 AND ISNULL(bo.HasHOSignal,0)=0 AND ISNULL(bo.HasRegionSignal,0)=0 AND ISNULL(fkin.Cnt,0)+ISNULL(vfkin.Cnt,0)+ISNULL(cr.Cnt,0)=0 AND ent.MasterEntity IS NULL THEN N'Generated' ELSE N'Unknown' END,
+CASE WHEN idc.IdentityColOwner=N'HO' THEN N'PK_HO_OWNED' WHEN ho.HOColCnt>0 AND(ho.HOColIsPK=1 OR ho.HOColIsUnique=1)THEN N'HO_UNIQUE_KEY' WHEN idc.IdentityColOwner=N'Region' THEN N'PK_REGION_OWNED' WHEN td.CompositePK=1 AND td.HasBranchId=1 THEN N'COMPOSITE_WITH_BRANCH' WHEN ISNULL(ex.InHO,0)=1 AND ISNULL(ex.InRegion,0)=0 THEN N'HO_ONLY_EXISTENCE' WHEN ISNULL(ex.InHO,0)=0 AND ISNULL(ex.InRegion,0)=1 THEN N'REGION_ONLY_EXISTENCE' WHEN ISNULL(idc.IdentityColOwner,N'')NOT IN(N'HO',N'Region')AND ISNULL(ho.HOColCnt,0)=0 AND idc.PKDataType IN(N'varchar',N'nvarchar',N'char',N'nchar')THEN N'SHARED_BUSINESS_KEY' WHEN td.HasIdentity=1 AND idc.IdentityColOwner IS NULL AND ISNULL(fkin.Cnt,0)+ISNULL(vfkin.Cnt,0)+ISNULL(cr.Cnt,0)=0 AND ent.MasterEntity IS NULL THEN N'GENERATED_NO_SIGNALS' ELSE N'UNKNOWN' END,
+CASE WHEN idc.IdentityColOwner=N'HO' THEN N'PK_HO_OWNER' WHEN ho.HOColCnt>0 AND(ho.HOColIsPK=1 OR ho.HOColIsUnique=1)THEN N'HO_KEY_COLUMN' WHEN idc.IdentityColOwner=N'Region' THEN N'PK_REGION_OWNER' WHEN td.CompositePK=1 AND td.HasBranchId=1 THEN N'COMPOSITE_BRANCH' WHEN ISNULL(ex.InHO,0)=1 AND ISNULL(ex.InRegion,0)=0 THEN N'HO_SCHEMA_ONLY' WHEN ISNULL(ex.InHO,0)=0 AND ISNULL(ex.InRegion,0)=1 THEN N'REGION_SCHEMA_ONLY' WHEN ISNULL(idc.IdentityColOwner,N'')NOT IN(N'HO',N'Region')AND ISNULL(ho.HOColCnt,0)=0 AND idc.PKDataType IN(N'varchar',N'nvarchar',N'char',N'nchar')THEN N'SHARED_NATURAL_KEY' WHEN td.HasIdentity=1 AND idc.IdentityColOwner IS NULL AND ISNULL(fkin.Cnt,0)+ISNULL(vfkin.Cnt,0)+ISNULL(cr.Cnt,0)=0 AND ent.MasterEntity IS NULL THEN N'GENERATED_LOCAL' ELSE N'NO_SIGNALS' END,
+CASE WHEN idc.IdentityColOwner=N'HO' THEN N'Pass1: PK ['+idc.[IdentityCol]+N'] ReferenceOwner=HO' WHEN ho.HOColCnt>0 AND(ho.HOColIsPK=1 OR ho.HOColIsUnique=1)THEN N'Pass1: HO col ['+ho.HOBestCol+N'] is '+CASE WHEN ho.HOColIsPK=1 THEN N'PK' ELSE N'unique' END+N'. Entity='+ISNULL(ho.BestHOEntity,N'?') WHEN idc.IdentityColOwner=N'Region' THEN N'Pass1: PK ['+idc.[IdentityCol]+N'] ReferenceOwner=Region' WHEN td.CompositePK=1 AND td.HasBranchId=1 THEN N'Pass1: Composite PK with BranchId' WHEN ISNULL(ex.InHO,0)=1 AND ISNULL(ex.InRegion,0)=0 THEN N'Pass1: Schema only in HO' WHEN ISNULL(ex.InHO,0)=0 AND ISNULL(ex.InRegion,0)=1 THEN N'Pass1: Schema only in Region' WHEN ISNULL(idc.IdentityColOwner,N'')NOT IN(N'HO',N'Region')AND ISNULL(ho.HOColCnt,0)=0 AND idc.PKDataType IN(N'varchar',N'nvarchar',N'char',N'nchar')THEN N'Pass1: Natural key shared' WHEN td.HasIdentity=1 AND idc.IdentityColOwner IS NULL AND ISNULL(fkin.Cnt,0)+ISNULL(vfkin.Cnt,0)+ISNULL(cr.Cnt,0)=0 AND ent.MasterEntity IS NULL THEN N'Pass1: Generated locally' ELSE N'Pass1: No signals' END,
+CASE WHEN idc.IdentityColOwner=N'HO' THEN N'HO' WHEN ho.HOColCnt>0 AND(ho.HOColIsPK=1 OR ho.HOColIsUnique=1)THEN N'HO' WHEN idc.IdentityColOwner=N'Region' THEN N'Region' WHEN td.CompositePK=1 AND td.HasBranchId=1 THEN N'Composite' WHEN ISNULL(ex.InHO,0)=1 AND ISNULL(ex.InRegion,0)=0 THEN N'HO' WHEN ISNULL(ex.InHO,0)=0 AND ISNULL(ex.InRegion,0)=1 THEN N'Region' WHEN ISNULL(idc.IdentityColOwner,N'')NOT IN(N'HO',N'Region')AND ISNULL(ho.HOColCnt,0)=0 AND idc.PKDataType IN(N'varchar',N'nvarchar',N'char',N'nchar')THEN N'Shared' WHEN td.HasIdentity=1 AND idc.IdentityColOwner IS NULL AND ISNULL(fkin.Cnt,0)+ISNULL(vfkin.Cnt,0)+ISNULL(cr.Cnt,0)=0 AND ent.MasterEntity IS NULL THEN N'Generated' ELSE N'Unknown' END,
+CASE WHEN td.CompositePK=1 THEN N'Composite' WHEN idc.PKDataType=N'uniqueidentifier' THEN N'External' WHEN idc.IsIdentity=1 THEN N'Surrogate' WHEN idc.PKDataType IN(N'varchar',N'nvarchar',N'char',N'nchar')THEN N'Natural' WHEN td.HasIdentity=1 THEN N'Surrogate' ELSE N'Unknown' END,
+CASE WHEN idc.IdentityColOwner=N'HO' THEN N'Preserve' WHEN ho.HOColCnt>0 AND(ho.HOColIsPK=1 OR ho.HOColIsUnique=1)THEN N'Preserve' WHEN idc.IdentityColOwner=N'Region' AND ISNULL(ex.InHO,0)=0 THEN N'Preserve' WHEN idc.IdentityColOwner=N'Region' AND ISNULL(ex.InHO,0)=1 THEN N'IdentityMap' WHEN td.CompositePK=1 AND td.HasBranchId=1 THEN N'Preserve' WHEN idc.PKDataType IN(N'varchar',N'nvarchar',N'char',N'nchar')AND ISNULL(idc.IdentityColOwner,N'')NOT IN(N'HO',N'Region')AND ISNULL(ho.HOColCnt,0)=0 THEN N'Merge' WHEN td.HasIdentity=1 AND idc.IdentityColOwner IS NULL AND ISNULL(fkin.Cnt,0)+ISNULL(vfkin.Cnt,0)+ISNULL(cr.Cnt,0)=0 AND ent.MasterEntity IS NULL THEN N'Generate' ELSE N'Rekey' END,
+ISNULL(ro.HOCnt,0),ISNULL(ro.RegionCnt,0),ISNULL(ex.InHO,0),ISNULL(ex.InRegion,0),ISNULL(ex.RegionDBCount,0),CASE WHEN ho.HOBestCol IS NOT NULL THEN 1 ELSE 0 END,ho.HOBestCol
+FROM dbo.TableDetails td LEFT JOIN #IP_IDCOL idc ON idc.SchemaName=td.SchemaName AND idc.TableName=td.TableName LEFT JOIN #IP_HO ho ON ho.SchemaName=td.SchemaName AND ho.TableName=td.TableName LEFT JOIN #IP_ROC ro ON ro.SchemaName=td.SchemaName AND ro.TableName=td.TableName LEFT JOIN #IP_EX ex ON ex.SchemaName=td.SchemaName AND ex.TableName=td.TableName LEFT JOIN #IP_ENT ent ON ent.SchemaName=td.SchemaName AND ent.TableName=td.TableName LEFT JOIN #IP_BO bo ON bo.SchemaName=td.SchemaName AND bo.TableName=td.TableName LEFT JOIN #IP_FKIN fkin ON fkin.Sch=td.SchemaName AND fkin.Tbl=td.TableName LEFT JOIN #IP_VFKIN vfkin ON vfkin.Sch=td.SchemaName AND vfkin.Tbl=td.TableName LEFT JOIN #IP_CRE cr ON cr.Sch=td.SchemaName AND cr.Tbl=td.TableName WHERE td.DatabaseName=@TemplateDB;
+DECLARE @msg NVARCHAR(MAX)=N'[PHASE 2.ID] Pass 1: '+CAST(@@ROWCOUNT AS NVARCHAR)+N' tables.'; PRINT @msg;
+-- Pass 2, 2b, 3
+-- FIX: HO_FK_DEPENDENCY must not promote relationship/detail/audit child tables to HO ownership
+-- merely because they FK to an HO entity. A table referencing genEmployees is not itself HO master data
+-- if graph shape or name already marks it as TransactionDetail/Audit (e.g. genEmployeeCommission, genUserLogin).
+UPDATE ip SET ip.IdentityOwner=N'HO',ip.IdentityAuthority=N'HO',ip.OwnershipRule=N'HO_FK_DEPENDENCY',ip.ReasonCode=N'HO_FK_DEPENDENCY',ip.ReasonText=N'Pass2: FK to HO table ['+dep.ParentTable+N']' FROM dbo.IdentityPlan ip CROSS APPLY(SELECT TOP 1 fk.ReferencedTable AS ParentTable FROM dbo.TableFKDetails fk JOIN dbo.IdentityPlan ip2 ON ip2.SchemaName=fk.ReferencedSchema AND ip2.TableName=fk.ReferencedTable WHERE fk.DatabaseName=@TemplateDB AND fk.SchemaName=ip.SchemaName AND fk.TableName=ip.TableName AND fk.IsSelfReference=0 AND ip2.IdentityOwner=N'HO' ORDER BY ip2.TotalIncomingRefs DESC)dep
+LEFT JOIN dbo.DependencyGraph dg ON dg.SchemaName=ip.SchemaName AND dg.TableName=ip.TableName
+WHERE ip.IdentityOwner=N'Unknown' AND ISNULL(ip.ExistsInHO,0)=1
+  AND ISNULL(dg.RoughCategory,N'')NOT IN(N'TransactionDetail',N'TransactionHeader')
+  AND NOT EXISTS(SELECT 1 FROM dbo.SemanticVocabulary sv WHERE sv.Category=N'Generic' AND ip.TableName LIKE N'%'+sv.Term+N'%');
+UPDATE ip SET ip.HOColumnCount=ISNULL(ro.HOCnt,0),ip.RegionColumnCount=ISNULL(ro.RegionCnt,0),ip.RegionDatabaseCount=ISNULL(ex.RegionDBCount,0) FROM dbo.IdentityPlan ip LEFT JOIN #IP_ROC ro ON ro.SchemaName=ip.SchemaName AND ro.TableName=ip.TableName LEFT JOIN #IP_EX ex ON ex.SchemaName=ip.SchemaName AND ex.TableName=ip.TableName;
+UPDATE ip SET ip.IdentityEntity=COALESCE(hoent.Entity,ent.MasterEntity,ho.BestHOEntity,ent2.MasterEntity) FROM dbo.IdentityPlan ip LEFT JOIN #IP_HOENT hoent ON hoent.SchemaName=ip.SchemaName AND hoent.TableName=ip.TableName LEFT JOIN #IP_ENT ent ON ent.SchemaName=ip.SchemaName AND ent.TableName=ip.TableName LEFT JOIN #IP_HO ho ON ho.SchemaName=ip.SchemaName AND ho.TableName=ip.TableName LEFT JOIN #IP_ENT ent2 ON ent2.SchemaName=ip.SchemaName AND ent2.TableName=ip.TableName;
+UPDATE ip SET ip.IncomingDeclaredFKs=ISNULL(fk.Cnt,0),ip.IncomingVirtualFKs=ISNULL(vfk.Cnt,0),ip.IncomingColumnRels=ISNULL(cr.Cnt,0),ip.OutgoingDeclaredFKs=ISNULL(fko.Cnt,0),ip.BusinessReferenceCols=ISNULL(br.Cnt,0),ip.TotalIncomingRefs=ISNULL(fk.Cnt,0)+ISNULL(vfk.Cnt,0)+ISNULL(cr.Cnt,0)+ISNULL(br.Cnt,0) FROM dbo.IdentityPlan ip LEFT JOIN #IP_FKIN fk ON fk.Sch=ip.SchemaName AND fk.Tbl=ip.TableName LEFT JOIN #IP_VFKIN vfk ON vfk.Sch=ip.SchemaName AND vfk.Tbl=ip.TableName LEFT JOIN #IP_CRE cr ON cr.Sch=ip.SchemaName AND cr.Tbl=ip.TableName LEFT JOIN #IP_FKOUT fko ON fko.Sch=ip.SchemaName AND fko.Tbl=ip.TableName LEFT JOIN #IP_ENT ent ON ent.SchemaName=ip.SchemaName AND ent.TableName=ip.TableName LEFT JOIN #IP_BIZREF br ON br.MasterEntity=ent.MasterEntity;
+-- Parent/Child
+IF OBJECT_ID('tempdb..#IP_EXT')IS NOT NULL DROP TABLE #IP_EXT;
+SELECT fk.ReferencedSchema AS PS,fk.ReferencedTable AS PT,fk.SchemaName AS CS,fk.TableName AS CT,fk.FKColumns AS FC,N'DeclaredFK' AS FS,CASE WHEN pk_c.ColumnName IS NOT NULL THEN N'1:1' WHEN EXISTS(SELECT 1 FROM #IP_UNQ u WHERE u.SchemaName=fk.SchemaName AND u.TableName=fk.TableName AND(u.KeyColumns=QUOTENAME(fk.FKColumns)OR u.KeyColumns LIKE N'['+fk.FKColumns+N'],%' OR u.KeyColumns LIKE N'%, ['+fk.FKColumns+N']%'))THEN N'1:1' ELSE N'1:N' END AS Card,ISNULL(cc.TotalCols,0)-ISNULL(pc.PKCols,0)-ISNULL(cc.AuditCols,0)-1 AS AC INTO #IP_EXT FROM dbo.TableFKDetails fk JOIN dbo.TablePKColumns pk_p ON pk_p.DatabaseName=@TemplateDB AND pk_p.SchemaName=fk.ReferencedSchema AND pk_p.TableName=fk.ReferencedTable AND pk_p.ColumnName=fk.ReferencedColumns AND pk_p.Ordinal=1 LEFT JOIN dbo.TablePKColumns pk_c ON pk_c.DatabaseName=@TemplateDB AND pk_c.SchemaName=fk.SchemaName AND pk_c.TableName=fk.TableName AND pk_c.ColumnName=fk.FKColumns AND pk_c.Ordinal=1 LEFT JOIN #IP_CC cc ON cc.SchemaName=fk.SchemaName AND cc.TableName=fk.TableName LEFT JOIN #IP_PC pc ON pc.SchemaName=fk.SchemaName AND pc.TableName=fk.TableName WHERE fk.DatabaseName=@TemplateDB AND fk.IsSelfReference=0 AND pk_c.ColumnName IS NULL;
+UPDATE ip SET ip.IdentityParent=ext.PT,ip.RelationshipType=N'IdentityExtension',ip.RelationshipCardinality=N'1:1',ip.ChildAttributeCount=ext.AC,ip.IdentityType=N'Inherited' FROM dbo.IdentityPlan ip JOIN(SELECT CS,CT,PS,PT,Card,AC,ROW_NUMBER()OVER(PARTITION BY CS,CT ORDER BY AC DESC)AS rn FROM #IP_EXT WHERE Card=N'1:1' AND AC>0)ext ON ext.CS=ip.SchemaName AND ext.CT=ip.TableName AND ext.rn=1;
+UPDATE ip SET ip.RelationshipType=N'FKReference' FROM dbo.IdentityPlan ip WHERE ip.RelationshipType IS NULL AND EXISTS(SELECT 1 FROM #IP_EXT ext WHERE ext.CS=ip.SchemaName AND ext.CT=ip.TableName AND(ext.Card=N'1:N' OR ext.AC<=0));
+UPDATE ip_p SET ip_p.IdentityChild=ext.RepChild,ip_p.RelationshipType=N'IdentityAnchor' FROM dbo.IdentityPlan ip_p CROSS APPLY(SELECT TOP 1 ic.TableName AS RepChild FROM dbo.IdentityPlan ic WHERE ic.IdentityParent=ip_p.TableName AND ic.SchemaName=ip_p.SchemaName ORDER BY ic.TotalIncomingRefs DESC)ext WHERE ip_p.IdentityChild IS NULL AND EXISTS(SELECT 1 FROM dbo.IdentityPlan ic2 WHERE ic2.IdentityParent=ip_p.TableName AND ic2.SchemaName=ip_p.SchemaName);
+UPDATE ip SET ip.IdentityAnchor=1 FROM dbo.IdentityPlan ip WHERE ip.RelationshipType=N'IdentityAnchor' OR EXISTS(SELECT 1 FROM dbo.IdentityPlan ic3 WHERE ic3.IdentityParent=ip.TableName AND ic3.SchemaName=ip.SchemaName);
+UPDATE child SET child.IdentityResolution=CASE WHEN parent.IdentityAuthority=N'HO' THEN N'IdentityMap' ELSE child.IdentityResolution END FROM dbo.IdentityPlan child JOIN dbo.IdentityPlan parent ON parent.SchemaName=child.SchemaName AND parent.TableName=child.IdentityParent WHERE child.RelationshipType=N'IdentityExtension';
+SELECT IdentityOwner,COUNT(*)AS T FROM dbo.IdentityPlan GROUP BY IdentityOwner ORDER BY COUNT(*)DESC;
+SELECT OwnershipRule,COUNT(*)AS T FROM dbo.IdentityPlan GROUP BY OwnershipRule ORDER BY COUNT(*)DESC;
+SELECT IdentityResolution,COUNT(*)AS T FROM dbo.IdentityPlan GROUP BY IdentityResolution ORDER BY COUNT(*)DESC;
+DROP TABLE #IP_PK; DROP TABLE #IP_IDCOL; DROP TABLE #IP_HO; DROP TABLE #IP_ROC; DROP TABLE #IP_EX; DROP TABLE #IP_ENT; DROP TABLE #IP_HOENT; DROP TABLE #IP_FKIN; DROP TABLE #IP_VFKIN; DROP TABLE #IP_FKOUT; DROP TABLE #IP_BIZREF; DROP TABLE #IP_CRE; DROP TABLE #IP_UNQ; DROP TABLE #IP_CC; DROP TABLE #IP_PC; DROP TABLE #IP_BO; DROP TABLE #IP_EXT;
+GO
+-- ═══ PHASE 1C: SOURCE POLICY PLAN (BEFORE STRATEGY PLAN!) ═══
+PRINT N'[PHASE 1C] Source Policy Plan...';
+IF OBJECT_ID('dbo.SourcePolicyPlan','U') IS NOT NULL DROP TABLE dbo.SourcePolicyPlan;
+CREATE TABLE dbo.SourcePolicyPlan(
+    SchemaName SYSNAME NOT NULL,
+    TableName SYSNAME NOT NULL,
+    SourcePolicy NVARCHAR(32) NOT NULL,
+    MergePriority INT NOT NULL DEFAULT 0,
+    MergeOrder NVARCHAR(32) NOT NULL,
+    ConflictPolicy NVARCHAR(32) NOT NULL DEFAULT N'Merge',
+    GovernanceStatus NVARCHAR(32) NOT NULL DEFAULT N'APPROVED',
+    PolicyRule NVARCHAR(64) NOT NULL,
+    ReasonCode NVARCHAR(64) NOT NULL,
+    ReasonText NVARCHAR(512) NOT NULL,
+    RuleId INT NULL,
+    CONSTRAINT PK_SourcePolicyPlan PRIMARY KEY(SchemaName,TableName)
+);
+
+-- Populate SourcePolicyPlan
+-- FIX (architectural): SourcePolicy answers "which databases contribute rows" -- that is a function of
+-- ExistsInHO/ExistsInRegion, NOT of IdentityOwner. IdentityOwner answers "who owns the identity", a
+-- different question. The two are correlated but not equivalent (e.g. Composite/Shared tables can exist
+-- in both HO and Region and must get SourcePolicy=BOTH, not fall through to TEMPLATE_ONLY).
+-- IdentityOwner is retained only to drive MergePriority/MergeOrder tie-breaking during merge.
+-- Every IdentityOwner value Layer 2 can currently produce (HO, Region, Composite, Shared, Generated,
+-- Unknown) is handled explicitly below with no catch-all business decision. If IdentityPlan ever emits
+-- an owner value outside this set, the build THROWs immediately instead of silently mis-routing tables.
+IF EXISTS(SELECT 1 FROM dbo.IdentityPlan WHERE IdentityOwner NOT IN(N'HO',N'Region',N'Composite',N'Shared',N'Generated',N'Unknown'))
+BEGIN
+    DECLARE @BadOwner NVARCHAR(32) = (SELECT TOP 1 IdentityOwner FROM dbo.IdentityPlan WHERE IdentityOwner NOT IN(N'HO',N'Region',N'Composite',N'Shared',N'Generated',N'Unknown'));
+    DECLARE @BadOwnerMsg NVARCHAR(400) = N'SourcePolicyPlan: unrecognized IdentityOwner value ['+ISNULL(@BadOwner,N'NULL')+N'] found in IdentityPlan. Add an explicit SourcePolicy rule for this owner before proceeding.';
+    THROW 51020, @BadOwnerMsg, 1;
+END
+
+INSERT INTO dbo.SourcePolicyPlan(SchemaName, TableName, SourcePolicy, MergePriority, MergeOrder, 
+    ConflictPolicy, GovernanceStatus, PolicyRule, ReasonCode, ReasonText)
+SELECT 
+    ip.SchemaName,
+    ip.TableName,
+    -- SourcePolicy: derived from actual existence, not identity ownership
+    CASE 
+        WHEN ISNULL(ip.ExistsInHO,0) = 1 AND ISNULL(ip.ExistsInRegion,0) = 1 THEN N'BOTH'
+        WHEN ISNULL(ip.ExistsInHO,0) = 1 AND ISNULL(ip.ExistsInRegion,0) = 0 THEN N'HO_ONLY'
+        WHEN ISNULL(ip.ExistsInHO,0) = 0 AND ISNULL(ip.ExistsInRegion,0) = 1 THEN N'REGION_ONLY'
+        WHEN ISNULL(ip.ExistsInHO,0) = 0 AND ISNULL(ip.ExistsInRegion,0) = 0 THEN N'TEMPLATE_ONLY'
+        -- unreachable given the IdentityOwner guard above plus ExistsInHO/ExistsInRegion being BIT NOT NULL-defaulted upstream,
+        -- but fail loud rather than silently defaulting if it ever is
+        ELSE N'UNRESOLVED'
+    END AS SourcePolicy,
+    -- MergePriority/MergeOrder: IdentityOwner's proper job -- sequencing, not sourcing
+    CASE ip.IdentityOwner
+        WHEN N'HO'        THEN 0
+        WHEN N'Composite'  THEN 500
+        WHEN N'Shared'     THEN 500
+        WHEN N'Region'     THEN 1000
+        WHEN N'Generated'  THEN 1500
+        WHEN N'Unknown'    THEN 2000
+    END AS MergePriority,
+    CASE ip.IdentityOwner
+        WHEN N'HO'        THEN N'HO_FIRST'
+        WHEN N'Composite'  THEN N'HO_FIRST'
+        WHEN N'Shared'     THEN N'HO_FIRST'
+        WHEN N'Region'     THEN N'REGION_AFTER_HO'
+        WHEN N'Generated'  THEN N'ANY'
+        WHEN N'Unknown'    THEN N'ANY'
+    END AS MergeOrder,
+    N'Merge' AS ConflictPolicy,
+    CASE WHEN ip.IdentityOwner = N'Unknown' THEN N'PENDING_REVIEW' ELSE N'APPROVED' END AS GovernanceStatus,
+    CASE 
+        WHEN ISNULL(ip.ExistsInHO,0) = 1 AND ISNULL(ip.ExistsInRegion,0) = 1 THEN N'SPP_BOTH'
+        WHEN ISNULL(ip.ExistsInHO,0) = 1 AND ISNULL(ip.ExistsInRegion,0) = 0 THEN N'SPP_HO_ONLY'
+        WHEN ISNULL(ip.ExistsInHO,0) = 0 AND ISNULL(ip.ExistsInRegion,0) = 1 THEN N'SPP_REGION_ONLY'
+        ELSE N'SPP_TEMPLATE_ONLY'
+    END AS PolicyRule,
+    CASE 
+        WHEN ISNULL(ip.ExistsInHO,0) = 1 AND ISNULL(ip.ExistsInRegion,0) = 1 THEN N'SRC_BOTH'
+        WHEN ISNULL(ip.ExistsInHO,0) = 1 AND ISNULL(ip.ExistsInRegion,0) = 0 THEN N'SRC_HO_EXCLUSIVE'
+        WHEN ISNULL(ip.ExistsInHO,0) = 0 AND ISNULL(ip.ExistsInRegion,0) = 1 THEN N'SRC_REGION_EXCLUSIVE'
+        ELSE N'SRC_TEMPLATE_ONLY'
+    END AS ReasonCode,
+    CASE 
+        WHEN ISNULL(ip.ExistsInHO,0) = 1 AND ISNULL(ip.ExistsInRegion,0) = 1 THEN N'Table exists in both HO and regions (IdentityOwner='+ip.IdentityOwner+N')'
+        WHEN ISNULL(ip.ExistsInHO,0) = 1 AND ISNULL(ip.ExistsInRegion,0) = 0 THEN N'Table exists in HO only (IdentityOwner='+ip.IdentityOwner+N')'
+        WHEN ISNULL(ip.ExistsInHO,0) = 0 AND ISNULL(ip.ExistsInRegion,0) = 1 THEN N'Table exists in region(s) only (IdentityOwner='+ip.IdentityOwner+N')'
+        ELSE N'Template-only table, no data source in HO or region (IdentityOwner='+ip.IdentityOwner+N')'
+    END AS ReasonText
+FROM dbo.IdentityPlan ip;
+
+DECLARE @sppCnt INT = @@ROWCOUNT;
+DECLARE @msg NVARCHAR(MAX) = N'[PHASE 1C] SourcePolicyPlan: ' + CAST(@sppCnt AS NVARCHAR) + N' tables.';
+PRINT @msg;
+
+PRINT N'[PHASE 3/9] Scoring...';
+IF OBJECT_ID('dbo.TableScoreBreakdown','U') IS NOT NULL DROP TABLE dbo.TableScoreBreakdown;
+CREATE TABLE dbo.TableScoreBreakdown(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,Category NVARCHAR(32) NOT NULL,SignalName NVARCHAR(64) NOT NULL,SignalValue NVARCHAR(256) NOT NULL,WeightApplied INT NOT NULL,Stance NVARCHAR(16) NULL,Reason NVARCHAR(128) NULL,CONSTRAINT PK_TSB PRIMARY KEY(SchemaName,TableName,Category,SignalName));
+IF OBJECT_ID('dbo.TableScores','U') IS NOT NULL DROP TABLE dbo.TableScores;
+CREATE TABLE dbo.TableScores(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,Category NVARCHAR(32) NOT NULL,Score INT NOT NULL,Rank INT NULL,EvidenceStrength INT NULL,ContradictionCount INT NULL,CONSTRAINT PK_TS PRIMARY KEY(SchemaName,TableName,Category));
+IF OBJECT_ID('dbo.EvidenceWeights','U') IS NOT NULL DROP TABLE dbo.EvidenceWeights;
+CREATE TABLE dbo.EvidenceWeights(WeightId INT IDENTITY PRIMARY KEY,SignalName NVARCHAR(64) NOT NULL,Category NVARCHAR(32) NOT NULL,MatchType CHAR(6) NOT NULL,MatchValue NVARCHAR(64) NULL,MinValue FLOAT NULL,MaxValue FLOAT NULL,Weight INT NOT NULL,Reason NVARCHAR(128) NULL);
+INSERT INTO dbo.EvidenceWeights SELECT SignalName,Category,MatchType,MatchValue,MinValue,MaxValue,Weight,Reason FROM dbo.EvidenceWeightConfig WHERE IsActive=1;
+WITH Matched AS(SELECT DISTINCT e.SchemaName,e.TableName,w.Category,w.Weight,w.SignalName,w.Reason,CASE e.SignalType WHEN 'B' THEN CAST(e.BooleanValue AS NVARCHAR) WHEN 'I' THEN CAST(e.IntegerValue AS NVARCHAR) WHEN 'D' THEN CAST(e.DecimalValue AS NVARCHAR) WHEN 'S' THEN e.StringValue END AS Val FROM dbo.TableEvidence e JOIN dbo.EvidenceWeights w ON e.SignalName=w.SignalName WHERE(w.MatchType='EQ' AND((e.SignalType='B' AND CAST(e.BooleanValue AS NVARCHAR)=w.MatchValue)OR(e.SignalType='I' AND CAST(e.IntegerValue AS NVARCHAR)=w.MatchValue)OR(e.SignalType='S' AND e.StringValue=w.MatchValue)))OR(w.MatchType='GT' AND e.SignalType IN('I','D')AND COALESCE(e.IntegerValue,CAST(e.DecimalValue AS INT))>w.MinValue)),
+Collapsed AS(SELECT SchemaName,TableName,Category,SignalName,MAX(Val)AS Val,SUM(Weight)AS Weight,MAX(Reason)AS Reason FROM Matched GROUP BY SchemaName,TableName,Category,SignalName)
+INSERT INTO dbo.TableScoreBreakdown SELECT SchemaName,TableName,Category,SignalName,Val,Weight,CASE WHEN Weight>0 THEN N'SUPPORTS' ELSE N'CONTRADICTS' END,Reason FROM Collapsed;
+WITH Scores AS(SELECT SchemaName,TableName,Category,SUM(WeightApplied)AS Score,SUM(ABS(WeightApplied))AS EvidenceStrength,ROW_NUMBER()OVER(PARTITION BY SchemaName,TableName ORDER BY SUM(WeightApplied)DESC)AS Rank FROM dbo.TableScoreBreakdown GROUP BY SchemaName,TableName,Category)
+INSERT INTO dbo.TableScores SELECT SchemaName,TableName,Category,Score,Rank,EvidenceStrength,0 FROM Scores;
+GO
+
+PRINT N'[PHASE 1D] Category Plan...';
+IF OBJECT_ID('dbo.CategoryPlan','U') IS NOT NULL DROP TABLE dbo.CategoryPlan;
+CREATE TABLE dbo.CategoryPlan(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,WinnerCategory NVARCHAR(32) NOT NULL,RunnerUpCategory NVARCHAR(32) NULL,WinnerScore INT NOT NULL DEFAULT 0,RunnerUpScore INT NOT NULL DEFAULT 0,ScoreDifference INT NOT NULL DEFAULT 0,Confidence INT NOT NULL DEFAULT 0,ConfidenceLevel NVARCHAR(16) NOT NULL,IsUncertain BIT NOT NULL DEFAULT 0,EvidenceStrength INT NOT NULL DEFAULT 0,ContradictionCount INT NOT NULL DEFAULT 0,CategoryRule NVARCHAR(64) NOT NULL,ReasonCode NVARCHAR(64) NOT NULL,ReasonText NVARCHAR(512) NOT NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT PK_CategoryPlan PRIMARY KEY(SchemaName,TableName));
+
+IF OBJECT_ID('tempdb..#CPS')IS NOT NULL DROP TABLE #CPS;
+SELECT s1.SchemaName,s1.TableName,s1.Category AS RawWinner,s1.Score AS RawWinnerScore,s1.EvidenceStrength AS RawStrength,ISNULL(s2.Category,N'')AS RawRunnerUp,ISNULL(s2.Score,0)AS RawRunnerUpScore INTO #CPS FROM dbo.TableScores s1 LEFT JOIN dbo.TableScores s2 ON s2.SchemaName=s1.SchemaName AND s2.TableName=s1.TableName AND s2.Rank=2 WHERE s1.Rank=1;
+
+IF OBJECT_ID('tempdb..#CPA')IS NOT NULL DROP TABLE #CPA;
+SELECT cs.SchemaName,cs.TableName,cs.RawWinner,CASE WHEN ip.IdentityAnchor=1 AND EXISTS(SELECT 1 FROM dbo.TableScores ts WHERE ts.SchemaName=cs.SchemaName AND ts.TableName=cs.TableName AND ts.Category=N'Master' AND ts.Score>0)AND cs.RawWinner<>N'Master' THEN N'Master' WHEN ip.RelationshipType=N'IdentityExtension' AND EXISTS(SELECT 1 FROM dbo.TableScores ts WHERE ts.SchemaName=cs.SchemaName AND ts.TableName=cs.TableName AND ts.Category=N'TransactionDetail' AND ts.Score>0)THEN N'TransactionDetail' WHEN ip.IdentityType=N'Natural' AND ip.IdentityOwner=N'Shared' AND EXISTS(SELECT 1 FROM dbo.TableScores ts WHERE ts.SchemaName=cs.SchemaName AND ts.TableName=cs.TableName AND ts.Category=N'Lookup' AND ts.Score>0)THEN N'Lookup' WHEN ip.IdentityType=N'Composite' AND cs.RawWinner=N'Unknown' AND dg.RoughCategory IS NOT NULL AND dg.RoughCategory<>N'Unknown' THEN dg.RoughCategory ELSE cs.RawWinner END AS Winner,CASE WHEN ip.IdentityAnchor=1 AND cs.RawWinner<>N'Master' THEN cs.RawWinner WHEN ip.RelationshipType=N'IdentityExtension' AND cs.RawWinner<>N'TransactionDetail' THEN cs.RawRunnerUp ELSE cs.RawRunnerUp END AS RunnerUp,cs.RawWinnerScore,cs.RawRunnerUpScore,cs.RawStrength,CASE WHEN ip.IdentityAnchor=1 AND cs.RawWinner<>N'Master' THEN N'IDENTITY_ANCHOR_OVERRIDE' WHEN ip.RelationshipType=N'IdentityExtension' THEN N'IDENTITY_EXTENSION' WHEN ip.IdentityType=N'Natural' AND ip.IdentityOwner=N'Shared' THEN N'SHARED_NATURAL_KEY' WHEN ip.IdentityType=N'Composite' AND cs.RawWinner=N'Unknown' THEN N'GRAPH_FALLBACK' ELSE N'SCORING_ENGINE' END AS CategoryRule,CASE WHEN ip.IdentityAnchor=1 AND cs.RawWinner<>N'Master' THEN N'CAT_ANCHOR_MASTER' WHEN ip.RelationshipType=N'IdentityExtension' THEN N'CAT_EXT_DETAIL' WHEN ip.IdentityType=N'Natural' AND ip.IdentityOwner=N'Shared' THEN N'CAT_SHARED_LOOKUP' WHEN ip.IdentityType=N'Composite' AND cs.RawWinner=N'Unknown' THEN N'CAT_GRAPH_FALLBACK' ELSE N'CAT_SCORING' END AS ReasonCode INTO #CPA FROM #CPS cs JOIN dbo.IdentityPlan ip ON ip.SchemaName=cs.SchemaName AND ip.TableName=cs.TableName LEFT JOIN dbo.DependencyGraph dg ON dg.SchemaName=cs.SchemaName AND dg.TableName=cs.TableName;
+
+INSERT INTO dbo.CategoryPlan(SchemaName,TableName,WinnerCategory,RunnerUpCategory,WinnerScore,RunnerUpScore,ScoreDifference,Confidence,ConfidenceLevel,IsUncertain,EvidenceStrength,ContradictionCount,CategoryRule,ReasonCode,ReasonText)
+SELECT SchemaName,TableName,Winner,RunnerUp,RawWinnerScore,CASE WHEN Winner=RawWinner THEN RawRunnerUpScore ELSE RawWinnerScore END,CASE WHEN Winner=RawWinner THEN RawWinnerScore-RawRunnerUpScore ELSE RawWinnerScore END,
+CASE WHEN Winner=RawWinner AND RawWinnerScore-ISNULL(RawRunnerUpScore,0)>=15 THEN 90 WHEN Winner=RawWinner AND RawWinnerScore-ISNULL(RawRunnerUpScore,0)>=10 THEN 70 WHEN Winner<>RawWinner THEN 75 ELSE 50 END,
+CASE WHEN Winner=RawWinner AND RawWinnerScore-ISNULL(RawRunnerUpScore,0)>=15 THEN N'High' WHEN Winner=RawWinner AND RawWinnerScore-ISNULL(RawRunnerUpScore,0)>=10 THEN N'Medium' WHEN Winner<>RawWinner THEN N'Medium' ELSE N'Low' END,
+CASE WHEN Winner=RawWinner AND RawWinnerScore-ISNULL(RawRunnerUpScore,0)>=15 THEN 0 ELSE 1 END,
+RawStrength,0,CategoryRule,ReasonCode,
+CASE WHEN CategoryRule=N'IDENTITY_ANCHOR_OVERRIDE' THEN N'Anchor overrides ['+RawWinner+N']' WHEN CategoryRule=N'IDENTITY_EXTENSION' THEN N'Extension inherits TransactionDetail' WHEN CategoryRule=N'SHARED_NATURAL_KEY' THEN N'Shared natural key → Lookup' WHEN CategoryRule=N'GRAPH_FALLBACK' THEN N'Graph fallback to '+Winner ELSE N'Scoring: '+Winner+N' ('+CAST(RawWinnerScore AS NVARCHAR)+N' pts)' END
+FROM #CPA;
+
+DECLARE @CatRows INT = @@ROWCOUNT;  -- ═══ FIX: Capture @@ROWCOUNT immediately ═══
+DROP TABLE #CPS; DROP TABLE #CPA;
+DECLARE @msg NVARCHAR(MAX)=N'[PHASE 2.CAT] CategoryPlan: '+CAST(@CatRows AS NVARCHAR)+N' tables.'; PRINT @msg;
+SELECT WinnerCategory,COUNT(*)AS T FROM dbo.CategoryPlan GROUP BY WinnerCategory ORDER BY COUNT(*)DESC;
+GO
+
+-- ═══ PHASE 1E: STRATEGY PLAN (WITH SOURCE POLICY VALIDATION!) ═══
+PRINT N'[PHASE 1E] Strategy Plan...';
+IF OBJECT_ID('dbo.StrategyPlan','U') IS NOT NULL DROP TABLE dbo.StrategyPlan;
+CREATE TABLE dbo.StrategyPlan(
+    SchemaName SYSNAME NOT NULL,
+    TableName SYSNAME NOT NULL,
+    UniquenessStrategy NVARCHAR(32) NOT NULL,
+    MigrationStrategy NVARCHAR(32) NOT NULL,
+    CompositeScenarioId INT NOT NULL DEFAULT 0,
+    PKType NVARCHAR(32) NOT NULL,
+    RequiredChildAction NVARCHAR(64) NOT NULL DEFAULT N'None',
+    IsUnsupported BIT NOT NULL DEFAULT 0,
+    UnsupportedReason NVARCHAR(256) NULL,
+    StrategyRule NVARCHAR(64) NOT NULL,
+    ReasonCode NVARCHAR(64) NOT NULL,
+    ReasonText NVARCHAR(512) NOT NULL,
+    Confidence INT NOT NULL DEFAULT 0,
+    RuleId INT NULL,
+    CONSTRAINT PK_StrategyPlan PRIMARY KEY(SchemaName,TableName)
+);
+DECLARE @TemplateDB SYSNAME=dbo.GetTemplateDB();
+
+-- Populate StrategyPlan WITH VALIDATION
+INSERT INTO dbo.StrategyPlan(SchemaName, TableName, UniquenessStrategy, MigrationStrategy, 
+    CompositeScenarioId, PKType, RequiredChildAction, IsUnsupported, UnsupportedReason,
+    StrategyRule, ReasonCode, ReasonText, Confidence, RuleId)
+SELECT 
+    ip.SchemaName,
+    ip.TableName,
+    CASE 
+        -- FIX: Prevent HO_ONLY + REKEY contradiction
+        WHEN spp.SourcePolicy = N'HO_ONLY' THEN N'Preserve'
+        WHEN ip.IdentityType = N'Composite' AND td.HasBranchId = 0 THEN N'ExpandPK'
+        WHEN ip.IdentityType = N'Numeric' THEN N'Rekey'
+        WHEN ip.IdentityType = N'Guid' THEN N'Preserve'
+        ELSE N'Preserve'
+    END AS UniquenessStrategy,
+    CASE 
+        -- FIX: Prevent HO_ONLY + REKEY contradiction
+        WHEN spp.SourcePolicy = N'HO_ONLY' THEN N'Preserve'
+        WHEN ip.IdentityType = N'Composite' AND td.HasBranchId = 0 THEN N'ExpandPK'
+        WHEN ip.IdentityType = N'Numeric' AND spp.SourcePolicy = N'REGION_ONLY' THEN N'Rekey'
+        WHEN ip.IdentityType = N'Guid' THEN N'Preserve'
+        ELSE N'Preserve'
+    END AS MigrationStrategy,
+    0 AS CompositeScenarioId,
+    ISNULL(td.PKDataType, N'Unknown') AS PKType,
+    CASE 
+        WHEN ip.IdentityType = N'Numeric' AND spp.SourcePolicy = N'REGION_ONLY' THEN N'RewriteFK'
+        WHEN ip.IdentityType = N'Composite' AND td.HasBranchId = 0 THEN N'AddBranchId'
+        ELSE N'None'
+    END AS RequiredChildAction,
+    0 AS IsUnsupported,
+    NULL AS UnsupportedReason,
+    CASE 
+        WHEN spp.SourcePolicy = N'HO_ONLY' THEN N'STRAT_HO_PRESERVE'
+        WHEN ip.IdentityType = N'Composite' AND td.HasBranchId = 0 THEN N'STRAT_COMP_EXPAND'
+        WHEN ip.IdentityType = N'Numeric' AND spp.SourcePolicy = N'REGION_ONLY' THEN N'STRAT_REGION_REKEY'
+        WHEN ip.IdentityType = N'Guid' THEN N'STRAT_GUID'
+        ELSE N'STRAT_DEFAULT'
+    END AS StrategyRule,
+    CASE 
+        WHEN spp.SourcePolicy = N'HO_ONLY' THEN N'STRAT_HO_PRESERVE'
+        WHEN ip.IdentityType = N'Composite' AND td.HasBranchId = 0 THEN N'STRAT_COMP_EXPAND'
+        WHEN ip.IdentityType = N'Numeric' AND spp.SourcePolicy = N'REGION_ONLY' THEN N'STRAT_REGION_REKEY'
+        WHEN ip.IdentityType = N'Guid' THEN N'STRAT_GUID'
+        ELSE N'STRAT_DEFAULT'
+    END AS ReasonCode,
+    CASE 
+        WHEN spp.SourcePolicy = N'HO_ONLY' THEN N'HO-only table: Preserve PK'
+        WHEN ip.IdentityType = N'Composite' AND td.HasBranchId = 0 THEN N'Composite PK without BranchId: ExpandPK'
+        WHEN ip.IdentityType = N'Numeric' AND spp.SourcePolicy = N'REGION_ONLY' THEN N'Region numeric PK: Rekey'
+        WHEN ip.IdentityType = N'Guid' THEN N'GUID PK: Preserve'
+        ELSE N'Default: Preserve'
+    END AS ReasonText,
+    80 AS Confidence,
+    NULL AS RuleId
+FROM dbo.IdentityPlan ip
+JOIN dbo.SourcePolicyPlan spp ON spp.SchemaName = ip.SchemaName AND spp.TableName = ip.TableName
+JOIN dbo.TableDetails td ON td.DatabaseName = @TemplateDB AND td.SchemaName = ip.SchemaName AND td.TableName = ip.TableName;
+
+DECLARE @spCnt INT = @@ROWCOUNT;
+DECLARE @msg NVARCHAR(MAX) = N'[PHASE 1E] StrategyPlan: ' + CAST(@spCnt AS NVARCHAR) + N' tables.';
+PRINT @msg;
+
+-- ═══ PHASE 1F: KEY STRATEGY PLAN ═══
+PRINT N'[PHASE 1F] Key Strategy Plan...';
+IF OBJECT_ID('dbo.KeyStrategyPlan','U') IS NOT NULL DROP TABLE dbo.KeyStrategyPlan;
+CREATE TABLE dbo.KeyStrategyPlan(
+    SchemaName SYSNAME NOT NULL,
+    TableName SYSNAME NOT NULL,
+    UniquenessStrategy NVARCHAR(32) NOT NULL,
+    MigrationStrategy NVARCHAR(32) NOT NULL,
+    MigrationMethod NVARCHAR(32) NOT NULL,
+    IsUnsupported BIT NOT NULL DEFAULT(0),
+    UnsupportedReason NVARCHAR(256) NULL,
+    GovernanceStatus NVARCHAR(32) NULL,
+    MasterKeyColumn NVARCHAR(256) NULL,
+    MasterEntity NVARCHAR(64) NULL,
+    CONSTRAINT PK_KSP PRIMARY KEY(SchemaName,TableName)
+);
+
+INSERT INTO dbo.KeyStrategyPlan(SchemaName, TableName, UniquenessStrategy, MigrationStrategy, 
+    MigrationMethod, IsUnsupported, UnsupportedReason, GovernanceStatus, MasterKeyColumn, MasterEntity)
+SELECT 
+    sp.SchemaName,
+    sp.TableName,
+    sp.UniquenessStrategy,
+    sp.MigrationStrategy,
+    CASE 
+        WHEN sp.MigrationStrategy = N'Preserve' THEN N'PRESERVE'
+        WHEN sp.MigrationStrategy = N'Rekey' THEN N'REKEY'
+        WHEN sp.MigrationStrategy = N'ExpandPK' THEN N'EXPAND_PK'
+        WHEN sp.MigrationStrategy = N'MergeToMaster' THEN N'MERGE_TO_MASTER'
+        ELSE N'PRESERVE'
+    END AS MigrationMethod,
+    sp.IsUnsupported,
+    sp.UnsupportedReason,
+    spp.GovernanceStatus,
+    ip.MasterKeyColumn,
+    ip.IdentityEntity
+FROM dbo.StrategyPlan sp
+JOIN dbo.SourcePolicyPlan spp ON spp.SchemaName = sp.SchemaName AND spp.TableName = sp.TableName
+JOIN dbo.IdentityPlan ip ON ip.SchemaName = sp.SchemaName AND ip.TableName = sp.TableName;
+
+DECLARE @kspCnt INT = @@ROWCOUNT;
+SET @msg = N'[PHASE 1F] KeyStrategyPlan: ' + CAST(@kspCnt AS NVARCHAR) + N' derived.';
+PRINT @msg;
+
+DECLARE @MasterSourceDB SYSNAME=dbo.GetMasterSourceDB();
+
+
+-- MILESTONE 2: V10 CONFIDENCE-BASED INFERENCE ENGINE (ADDITIVE). PHASE 2.ID has populated IdentityPlan
+PRINT N'[MILESTONE 2] V10 Confidence-Based Inference Engine...';
+
+
+-- V10.1: Infrastructure tables
+IF OBJECT_ID('dbo.EvidenceCatalog','U') IS NOT NULL DROP TABLE dbo.EvidenceCatalog;
+CREATE TABLE dbo.EvidenceCatalog(
+EvidenceId INT IDENTITY PRIMARY KEY, EvidenceKey NVARCHAR(64) NOT NULL UNIQUE,
+EvidenceGroup NVARCHAR(32) NOT NULL, Direction INT NOT NULL,
+BaseWeight DECIMAL(7,2) NOT NULL, MaxWeight DECIMAL(7,2) NULL,
+DecayRate DECIMAL(5,4) NULL, AppliesToOwner NVARCHAR(32) NOT NULL DEFAULT N'HO',
+Description NVARCHAR(256) NULL, IsActive BIT NOT NULL DEFAULT 1);
+IF OBJECT_ID('dbo.IdentityEvidence','U') IS NOT NULL DROP TABLE dbo.IdentityEvidence;
+CREATE TABLE dbo.IdentityEvidence(
+EvidenceId BIGINT IDENTITY PRIMARY KEY, SchemaName SYSNAME NOT NULL, TableName SYSNAME NOT NULL,
+EvidenceKey NVARCHAR(64) NOT NULL, EvidenceValue NVARCHAR(256) NULL,
+RawMagnitude INT NOT NULL DEFAULT 1, CollectedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+CollectorPhase NVARCHAR(32) NOT NULL,
+CONSTRAINT FK_IE_Catalog FOREIGN KEY (EvidenceKey) REFERENCES dbo.EvidenceCatalog(EvidenceKey));
+IF OBJECT_ID('dbo.IdentityScorecard','U') IS NOT NULL DROP TABLE dbo.IdentityScorecard;
+CREATE TABLE dbo.IdentityScorecard(
+ScorecardId BIGINT IDENTITY PRIMARY KEY, SchemaName SYSNAME NOT NULL, TableName SYSNAME NOT NULL,
+EvidenceKey NVARCHAR(64) NOT NULL, EvidenceGroup NVARCHAR(32) NOT NULL, AppliesToOwner NVARCHAR(32) NOT NULL,
+Direction INT NOT NULL, RawMagnitude INT NOT NULL, WeightedScore DECIMAL(9,2) NOT NULL,
+EvidenceValue NVARCHAR(256) NULL, IsWinning BIT NOT NULL DEFAULT 0,
+CONSTRAINT FK_ISC_Evidence FOREIGN KEY (EvidenceKey) REFERENCES dbo.EvidenceCatalog(EvidenceKey));
+IF OBJECT_ID('dbo.TableGraphMetrics','U') IS NOT NULL DROP TABLE dbo.TableGraphMetrics;
+CREATE TABLE dbo.TableGraphMetrics(
+SchemaName SYSNAME NOT NULL, TableName SYSNAME NOT NULL,
+InDegree INT NOT NULL DEFAULT 0, OutDegree INT NOT NULL DEFAULT 0,
+InOutRatio DECIMAL(7,3) NULL, GraphRole NVARCHAR(16) NOT NULL DEFAULT N'UNKNOWN',
+CONSTRAINT PK_TGM PRIMARY KEY (SchemaName, TableName));
+IF OBJECT_ID('dbo.PlannerQualityMetrics','U') IS NOT NULL DROP TABLE dbo.PlannerQualityMetrics;
+CREATE TABLE dbo.PlannerQualityMetrics(
+RunId UNIQUEIDENTIFIER NOT NULL, MetricName NVARCHAR(64) NOT NULL,
+MetricValue DECIMAL(9,4) NOT NULL, Threshold DECIMAL(9,4) NULL,
+Status NVARCHAR(16) NOT NULL, Details NVARCHAR(MAX) NULL,
+MeasuredAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+CONSTRAINT PK_PQM PRIMARY KEY (RunId, MetricName));
+IF OBJECT_ID('dbo.IdentityActionMatrix','U') IS NOT NULL DROP TABLE dbo.IdentityActionMatrix;
+CREATE TABLE dbo.IdentityActionMatrix(
+IdentityOwner NVARCHAR(32) NOT NULL, MigrationStrategy NVARCHAR(32) NOT NULL,
+HasMasterKey BIT NOT NULL, RecommendedAction NVARCHAR(32) NOT NULL,
+MinConfidence DECIMAL(5,2) NOT NULL DEFAULT 0,
+CONSTRAINT PK_IAM PRIMARY KEY (IdentityOwner, MigrationStrategy, HasMasterKey));
+-- V10.2: Seed evidence catalog (FIXED: all keys used in collection are included)
+INSERT INTO dbo.EvidenceCatalog (EvidenceKey, EvidenceGroup, Direction, BaseWeight, MaxWeight, DecayRate, AppliesToOwner, Description)
+VALUES
+(N'EXISTS_IN_HO', N'SCHEMA', +1, 12.00, 12.00, NULL, N'HO', N'Table exists in HO schema'),
+(N'EXISTS_IN_REGION_ONLY', N'SCHEMA', +1, 12.00, 12.00, NULL, N'Region', N'Table exists only in Region'),
+(N'HO_ONLY_EXISTENCE', N'SCHEMA', +1, 8.00, 8.00, NULL, N'HO', N'Exists in HO (not decisive alone)'),
+(N'HO_FK_DEPENDENCY', N'FK', +1, 15.00, 25.00, 0.85, N'HO', N'FK references HO-owned table'),
+(N'REGION_FK_DEPENDENCY', N'FK', +1, 15.00, 25.00, 0.85, N'Region', N'FK references Region-owned table'),
+(N'HIGH_INCOMING_REFS', N'FK', +1, 2.00, 30.00, 0.90, N'HO', N'Incoming FK references'),
+(N'LEAF_NODE', N'FK', -1, 10.00, 10.00, NULL, N'HO', N'No incoming references (leaf/transaction)'),
+(N'VOCAB_MASTER', N'VOCABULARY', +1, 20.00, 20.00, NULL, N'HO', N'Master entity vocabulary match'),
+(N'VOCAB_TRANSACTION', N'VOCABULARY', -1, 18.00, 18.00, NULL, N'HO', N'Transaction pattern'),
+(N'VOCAB_TEMPORAL', N'VOCABULARY', -1, 22.00, 22.00, NULL, N'HO', N'Temporal pattern'),
+(N'HO_PK_OWNER', N'PK', +1, 25.00, 25.00, NULL, N'HO', N'PK column from HO'),
+(N'REGION_PK_OWNER', N'PK', +1, 25.00, 25.00, NULL, N'Region', N'PK column from Region'),
+(N'GRAPH_ROOT', N'GRAPH', +1, 20.00, 20.00, NULL, N'HO', N'Graph root'),
+(N'GRAPH_HUB', N'GRAPH', +1, 10.00, 10.00, NULL, N'HO', N'Graph hub'),
+(N'GRAPH_LEAF', N'GRAPH', -1, 12.00, 12.00, NULL, N'HO', N'Graph leaf'),
+(N'GRAPH_BRIDGE', N'GRAPH', +1, 5.00, 5.00, NULL, N'Shared', N'Graph bridge'),
+(N'MASTER_KEY_PRESENT', N'SEMANTIC', +1, 25.00, 25.00, NULL, N'HO', N'MasterKeyColumn identified'),
+(N'MASTER_ENTITY_MATCH', N'SEMANTIC', +1, 20.00, 20.00, NULL, N'HO', N'Table matches master entity'),
+(N'HO_COLUMN_PATTERN', N'SEMANTIC', +1, 15.00, 15.00, NULL, N'HO', N'Column matches HO pattern'),
+(N'REGION_COLUMN_PATTERN', N'SEMANTIC', +1, 15.00, 15.00, NULL, N'Region', N'Column matches Region pattern'),
+(N'MASTER_KEY_ASSIGNED', N'SEMANTIC', +1, 30.00, 30.00, NULL, N'HO', N'IdentityPlan has resolved MasterKeyColumn'),
+(N'LOOKUP_NAME_PATTERN', N'VOCABULARY', +1, 12.00, 12.00, NULL, N'HO', N'Table name matches Lookup vocabulary (e.g. Master/Country/Currency)'),
+(N'LOOKUP_GRAPH_SHAPE', N'GRAPH', +1, 15.00, 15.00, NULL, N'HO', N'High incoming refs + no outgoing refs, classic lookup shape'),
+(N'HAS_BRANCHID_COLUMN', N'PK', -1, 20.00, 20.00, NULL, N'HO', N'Table carries a BranchId/RegionId column -- pushes away from HO ownership'),
+(N'HAS_COMPOSITE_PK', N'PK', -1, 15.00, 15.00, NULL, N'HO', N'Composite primary key -- pushes away from HO ownership'),
+(N'IS_TRANSACTION_DETAIL_SHAPE', N'GRAPH', -1, 25.00, 25.00, NULL, N'HO', N'Graph/vocabulary shape indicates transaction detail/child table -- pushes away from HO ownership');
+-- V10.3: Seed identity-action matrix
+INSERT INTO dbo.IdentityActionMatrix (IdentityOwner, MigrationStrategy, HasMasterKey, RecommendedAction, MinConfidence)
+VALUES
+(N'HO', N'Preserve', 0, N'Preserve', 50.00),
+(N'HO', N'Preserve', 1, N'Preserve', 50.00),
+(N'HO', N'MergeToMaster', 0, N'IdentityMap', 50.00),
+(N'HO', N'MergeToMaster', 1, N'IdentityMap', 50.00),
+(N'Region', N'Preserve', 0, N'Preserve', 50.00),
+(N'Region', N'Rekey', 0, N'Rekey', 50.00),
+(N'Region', N'MergeToMaster', 1, N'IdentityMap', 50.00),
+(N'Composite', N'Preserve', 0, N'Preserve', 50.00),
+(N'Shared', N'MergeLookup', 0, N'Merge', 50.00),
+(N'Generated', N'Append', 0, N'Generate', 50.00),
+(N'Unknown', N'Rekey', 0, N'Preserve', 0.00);
+-- V10.4: Compute graph metrics
+INSERT INTO dbo.TableGraphMetrics (SchemaName, TableName, InDegree, OutDegree)
+SELECT t.SchemaName, t.TableName, ISNULL(inc.Cnt, 0), ISNULL(outg.Cnt, 0)
+FROM (SELECT DISTINCT SchemaName, TableName FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB) t
+OUTER APPLY (SELECT COUNT(*) AS Cnt FROM dbo.TableFKDetails fk WHERE fk.ReferencedSchema = t.SchemaName AND fk.ReferencedTable = t.TableName AND fk.DatabaseName = @TemplateDB AND fk.IsSelfReference = 0) inc
+OUTER APPLY (SELECT COUNT(*) AS Cnt FROM dbo.TableFKDetails fk WHERE fk.SchemaName = t.SchemaName AND fk.TableName = t.TableName AND fk.DatabaseName = @TemplateDB AND fk.IsSelfReference = 0) outg;
+UPDATE dbo.TableGraphMetrics SET
+InOutRatio = CAST(InDegree AS DECIMAL(7,3)) / NULLIF(OutDegree, 0),
+GraphRole = CASE
+WHEN InDegree >= 10 AND OutDegree = 0 THEN N'ROOT'
+WHEN InDegree >= 10 AND OutDegree >= 3 THEN N'HUB'
+WHEN InDegree = 0 AND OutDegree >= 1 THEN N'LEAF'
+WHEN InDegree >= 1 AND OutDegree >= 1 AND InDegree <= 3 AND OutDegree <= 3 THEN N'BRIDGE'
+WHEN InDegree = 0 AND OutDegree = 0 THEN N'DISCONNECTED'
+ELSE N'INTERMEDIATE'
+END;
+-- V10.5: Evidence collection (FIXED: all keys exist in catalog, NULL EvidenceKey filtered)
+DELETE FROM dbo.IdentityEvidence;
+-- E1: Schema existence (FIXED: filter NULL EvidenceKey)
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT td.SchemaName, td.TableName,
+CASE
+WHEN EXISTS (SELECT 1 FROM dbo.TableDetails td2 WHERE td2.DatabaseName = @MasterSourceDB AND td2.SchemaName = td.SchemaName AND td2.TableName = td.TableName)
+AND NOT EXISTS (SELECT 1 FROM dbo.TableDetails td3 JOIN dbo.DiscoveryConfig dc ON dc.DBName = td3.DatabaseName WHERE td3.SchemaName = td.SchemaName AND td3.TableName = td.TableName AND dc.DatabaseRole = N'Region' AND dc.IsActive = 1)
+THEN N'EXISTS_IN_HO'
+WHEN NOT EXISTS (SELECT 1 FROM dbo.TableDetails td2 WHERE td2.DatabaseName = @MasterSourceDB AND td2.SchemaName = td.SchemaName AND td2.TableName = td.TableName)
+AND EXISTS (SELECT 1 FROM dbo.TableDetails td3 JOIN dbo.DiscoveryConfig dc ON dc.DBName = td3.DatabaseName WHERE td3.SchemaName = td.SchemaName AND td3.TableName = td.TableName AND dc.DatabaseRole = N'Region' AND dc.IsActive = 1)
+THEN N'EXISTS_IN_REGION_ONLY'
+WHEN EXISTS (SELECT 1 FROM dbo.TableDetails td2 WHERE td2.DatabaseName = @MasterSourceDB AND td2.SchemaName = td.SchemaName AND td2.TableName = td.TableName)
+THEN N'HO_ONLY_EXISTENCE'
+ELSE NULL
+END, 1, N'PHASE_E1_SCHEMA', N'Schema existence'
+FROM (SELECT DISTINCT DatabaseName,SchemaName, TableName FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB) td
+WHERE td.DatabaseName = @TemplateDB
+AND (EXISTS (SELECT 1 FROM dbo.TableDetails td2 WHERE td2.DatabaseName = @MasterSourceDB AND td2.SchemaName = td.SchemaName AND td2.TableName = td.TableName)
+OR EXISTS (SELECT 1 FROM dbo.TableDetails td3 JOIN dbo.DiscoveryConfig dc ON dc.DBName = td3.DatabaseName WHERE td3.SchemaName = td.SchemaName AND td3.TableName = td.TableName AND dc.DatabaseRole = N'Region' AND dc.IsActive = 1))
+AND (CASE
+WHEN EXISTS (SELECT 1 FROM dbo.TableDetails td2 WHERE td2.DatabaseName = @MasterSourceDB AND td2.SchemaName = td.SchemaName AND td2.TableName = td.TableName)
+AND NOT EXISTS (SELECT 1 FROM dbo.TableDetails td3 JOIN dbo.DiscoveryConfig dc ON dc.DBName = td3.DatabaseName WHERE td3.SchemaName = td.SchemaName AND td3.TableName = td.TableName AND dc.DatabaseRole = N'Region' AND dc.IsActive = 1)
+THEN N'EXISTS_IN_HO'
+WHEN NOT EXISTS (SELECT 1 FROM dbo.TableDetails td2 WHERE td2.DatabaseName = @MasterSourceDB AND td2.SchemaName = td.SchemaName AND td2.TableName = td.TableName)
+AND EXISTS (SELECT 1 FROM dbo.TableDetails td3 JOIN dbo.DiscoveryConfig dc ON dc.DBName = td3.DatabaseName WHERE td3.SchemaName = td.SchemaName AND td3.TableName = td.TableName AND dc.DatabaseRole = N'Region' AND dc.IsActive = 1)
+THEN N'EXISTS_IN_REGION_ONLY'
+WHEN EXISTS (SELECT 1 FROM dbo.TableDetails td2 WHERE td2.DatabaseName = @MasterSourceDB AND td2.SchemaName = td.SchemaName AND td2.TableName = td.TableName)
+THEN N'HO_ONLY_EXISTENCE'
+ELSE NULL
+END) IS NOT NULL;  -- FIX: Filter NULL EvidenceKey
+-- E4: Graph role (FIXED: GRAPH_BRIDGE now in catalog)
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT SchemaName, TableName, N'GRAPH_' + GraphRole, 1, N'PHASE_E4_GRAPH',
+N'InDegree=' + CAST(InDegree AS NVARCHAR) + N', OutDegree=' + CAST(OutDegree AS NVARCHAR)
+FROM dbo.TableGraphMetrics WHERE GraphRole IN (N'ROOT', N'HUB', N'LEAF', N'BRIDGE');
+-- E5: Vocabulary (positive + negative)
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT DISTINCT td.SchemaName, td.TableName, N'VOCAB_MASTER', 1, N'PHASE_E5_VOCAB', N'Master term match'
+FROM (SELECT DISTINCT DatabaseName,SchemaName, TableName FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB) td
+JOIN dbo.SemanticVocabulary sv ON td.TableName LIKE N'%' + sv.Term + N'%'
+WHERE sv.Category = N'Master' AND td.DatabaseName = @TemplateDB;
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT DISTINCT td.SchemaName, td.TableName, N'VOCAB_TRANSACTION', 1, N'PHASE_E5_VOCAB', N'Transaction term match'
+FROM (SELECT DISTINCT DatabaseName, SchemaName, TableName FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB) td
+JOIN dbo.SemanticVocabulary sv ON td.TableName LIKE N'%' + sv.Term + N'%'
+WHERE sv.Category IN (N'TransactionHeader', N'TransactionDetail') AND td.DatabaseName = @TemplateDB;
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT DISTINCT td.SchemaName, td.TableName, N'VOCAB_TEMPORAL', 1, N'PHASE_E5_VOCAB', N'Temporal term match'
+FROM (SELECT DISTINCT DatabaseName, SchemaName, TableName FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB) td
+JOIN dbo.SemanticVocabulary sv ON td.TableName LIKE N'%' + sv.Term + N'%'
+WHERE sv.Category = N'Audit' AND td.DatabaseName = @TemplateDB;
+-- E7: Column pattern
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT DISTINCT tc.SchemaName, tc.TableName, N'HO_COLUMN_PATTERN', 1, N'PHASE_E7_COLPAT', N'Column=[' + tc.ColumnName + N']'
+FROM dbo.TableColumns tc
+WHERE tc.DatabaseName = @TemplateDB AND (tc.ColumnName LIKE N'HO%ID' OR tc.ColumnName LIKE N'AHO%ID' OR tc.ColumnName LIKE N'HO%Code' OR tc.ColumnName LIKE N'HO%No');
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT DISTINCT tc.SchemaName, tc.TableName, N'REGION_COLUMN_PATTERN', 1, N'PHASE_E7_COLPAT', N'Column=[' + tc.ColumnName + N']'
+FROM dbo.TableColumns tc
+WHERE tc.DatabaseName = @TemplateDB AND tc.ColumnName IN (N'BranchId', N'BranchID', N'RegionId', N'RegionID');
+-- E8: Incoming refs
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT gm.SchemaName, gm.TableName, N'HIGH_INCOMING_REFS', gm.InDegree, N'PHASE_E8_INREFS',
+N'InDegree=' + CAST(gm.InDegree AS NVARCHAR)
+FROM dbo.TableGraphMetrics gm WHERE gm.InDegree > 0;
+-- E9: MasterKey (FIX: was in EvidenceCatalog but never collected -- IdentityPlan.MasterKeyColumn is a strong
+-- signal that HO ownership was already proven by the column-vocabulary pass, independent of PK shape)
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT ip.SchemaName, ip.TableName, N'MASTER_KEY_ASSIGNED', 1, N'PHASE_E9_MASTERKEY', N'MasterKeyColumn=[' + ip.MasterKeyColumn + N']'
+FROM dbo.IdentityPlan ip WHERE ip.HasMasterKey = 1 AND ip.MasterKeyColumn IS NOT NULL;
+-- E10: Lookup name pattern (FIX: classic ERP lookup/master tables like genCountryMaster, genCurrencyMaster
+-- were falling to Unknown because no single Pass-1 signal fired for them; table-name vocabulary match on
+-- the Lookup category is a real positive signal that was defined in SemanticVocabulary but unused by V10)
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT DISTINCT td.SchemaName, td.TableName, N'LOOKUP_NAME_PATTERN', 1, N'PHASE_E10_LOOKUP', N'Lookup term match'
+FROM (SELECT DISTINCT DatabaseName, SchemaName, TableName FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB) td
+JOIN dbo.SemanticVocabulary sv ON td.TableName LIKE N'%' + sv.Term + N'%'
+WHERE sv.Category = N'Lookup' AND td.DatabaseName = @TemplateDB;
+-- E11: Lookup graph shape -- many incoming refs, no outgoing refs, no BranchId: classic shared reference table
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT gm.SchemaName, gm.TableName, N'LOOKUP_GRAPH_SHAPE', 1, N'PHASE_E11_LOOKUPSHAPE', N'InDegree=' + CAST(gm.InDegree AS NVARCHAR) + N', OutDegree=0'
+FROM dbo.TableGraphMetrics gm
+JOIN dbo.TableDetails td ON td.DatabaseName = @TemplateDB AND td.SchemaName = gm.SchemaName AND td.TableName = gm.TableName
+WHERE gm.InDegree >= 3 AND gm.OutDegree = 0 AND ISNULL(td.HasBranchId,0) = 0;
+-- E12: BranchId penalty -- a table carrying its own BranchId column is regionally-scoped by construction
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT td.SchemaName, td.TableName, N'HAS_BRANCHID_COLUMN', 1, N'PHASE_E12_BRANCHPEN', N'HasBranchId=1'
+FROM dbo.TableDetails td WHERE td.DatabaseName = @TemplateDB AND ISNULL(td.HasBranchId,0) = 1;
+-- E13: Composite PK penalty -- composite keys are a Region/branch-scoping pattern, not an HO ownership signal
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT td.SchemaName, td.TableName, N'HAS_COMPOSITE_PK', 1, N'PHASE_E13_COMPPEN', N'CompositePK=1'
+FROM dbo.TableDetails td WHERE td.DatabaseName = @TemplateDB AND ISNULL(td.CompositePK,0) = 1;
+-- E14: TransactionDetail shape penalty -- graph shape (leaf, has parent, no children) or vocabulary match
+-- (Detail/Allocate/Commission/Activity/Login/History/Log) means this is child/audit data, not a master entity,
+-- regardless of whether its name also happens to contain a recognized entity term (e.g. genEmployeeCommission).
+INSERT INTO dbo.IdentityEvidence (SchemaName, TableName, EvidenceKey, RawMagnitude, CollectorPhase, EvidenceValue)
+SELECT DISTINCT dg.SchemaName, dg.TableName, N'IS_TRANSACTION_DETAIL_SHAPE', 1, N'PHASE_E14_DETAILPEN', N'RoughCategory=' + ISNULL(dg.RoughCategory,N'?')
+FROM dbo.DependencyGraph dg
+WHERE dg.RoughCategory IN (N'TransactionDetail', N'TransactionHeader')
+   OR EXISTS (SELECT 1 FROM dbo.SemanticVocabulary sv WHERE sv.Category = N'Generic' AND dg.TableName LIKE N'%' + sv.Term + N'%');
+SET @msg = N'[MILESTONE 2] V10 evidence collected: ' + CAST((SELECT COUNT(*) FROM dbo.IdentityEvidence) AS NVARCHAR) + N' rows.';
+PRINT @msg;
+-- V10.6: Scoring engine
+DELETE FROM dbo.IdentityScorecard;
+;WITH ScoredEvidence AS (
+SELECT ie.SchemaName, ie.TableName, ec.AppliesToOwner, ec.EvidenceKey, ec.EvidenceGroup, ec.Direction,
+ec.BaseWeight, ec.MaxWeight, ec.DecayRate, ie.RawMagnitude, ie.EvidenceValue,
+ie.RawMagnitude * ec.Direction *
+CASE
+WHEN ec.DecayRate IS NOT NULL AND ec.MaxWeight IS NOT NULL
+THEN (SELECT MIN(v) FROM (VALUES (ec.BaseWeight * POWER(ec.DecayRate, ie.RawMagnitude - 1)), (ec.MaxWeight)) x(v))
+WHEN ec.DecayRate IS NOT NULL THEN ec.BaseWeight * POWER(ec.DecayRate, ie.RawMagnitude - 1)
+WHEN ec.MaxWeight IS NOT NULL THEN (SELECT MIN(v) FROM (VALUES (ec.BaseWeight * ie.RawMagnitude), (ec.MaxWeight)) x(v))
+ELSE ec.BaseWeight * ie.RawMagnitude
+END AS WeightedScore
+FROM dbo.IdentityEvidence ie
+JOIN dbo.EvidenceCatalog ec ON ec.EvidenceKey = ie.EvidenceKey
+WHERE ec.IsActive = 1
+),
+OwnerScores AS (
+SELECT SchemaName, TableName, AppliesToOwner,
+SUM(WeightedScore) AS TotalScore,
+SUM(CASE WHEN WeightedScore > 0 THEN WeightedScore ELSE 0 END) AS PositiveScore,
+SUM(CASE WHEN WeightedScore < 0 THEN ABS(WeightedScore) ELSE 0 END) AS NegativeScore,
+COUNT(DISTINCT EvidenceGroup) AS EvidenceBreadth
+FROM ScoredEvidence GROUP BY SchemaName, TableName, AppliesToOwner
+),
+Ranked AS (
+SELECT SchemaName, TableName, AppliesToOwner, TotalScore, PositiveScore, NegativeScore, EvidenceBreadth,
+CAST(CASE WHEN PositiveScore + NegativeScore = 0 THEN 50.0 ELSE 50.0 + (TotalScore / 4.0) END AS DECIMAL(5,2)) AS Confidence,
+ROW_NUMBER() OVER (PARTITION BY SchemaName, TableName ORDER BY TotalScore DESC, EvidenceBreadth DESC) AS OwnerRank
+FROM OwnerScores
+)
+INSERT INTO dbo.IdentityScorecard (SchemaName, TableName, EvidenceKey, EvidenceGroup, AppliesToOwner, Direction, RawMagnitude, WeightedScore, EvidenceValue, IsWinning)
+SELECT se.SchemaName, se.TableName, se.EvidenceKey, se.EvidenceGroup, se.AppliesToOwner, se.Direction, se.RawMagnitude, se.WeightedScore, se.EvidenceValue,
+CASE WHEN r.OwnerRank = 1 AND r.AppliesToOwner = se.AppliesToOwner THEN 1 ELSE 0 END
+FROM ScoredEvidence se
+JOIN Ranked r ON r.SchemaName = se.SchemaName AND r.TableName = se.TableName
+WHERE r.OwnerRank = 1;
+-- V10.7: Update IdentityPlan with V10 results
+;WITH WinnerScores AS (
+SELECT SchemaName, TableName, AppliesToOwner AS V10Winner, TotalScore AS NetScore, PositiveScore, NegativeScore, EvidenceBreadth,
+Confidence AS ConfidenceScore,
+CASE WHEN Confidence >= 80 THEN N'AUTOMATIC' WHEN Confidence >= 50 THEN N'PROBABLE' WHEN Confidence >= 20 THEN N'NEEDS_REVIEW' ELSE N'UNKNOWN' END AS ClassificationTier,
+ROW_NUMBER() OVER (PARTITION BY SchemaName, TableName ORDER BY TotalScore DESC, EvidenceBreadth DESC) AS OwnerRank
+FROM (
+SELECT SchemaName, TableName, AppliesToOwner, SUM(WeightedScore) AS TotalScore,
+SUM(CASE WHEN WeightedScore > 0 THEN WeightedScore ELSE 0 END) AS PositiveScore,
+SUM(CASE WHEN WeightedScore < 0 THEN ABS(WeightedScore) ELSE 0 END) AS NegativeScore,
+COUNT(DISTINCT EvidenceGroup) AS EvidenceBreadth,
+CAST(50.0 + (SUM(WeightedScore) / 4.0) AS DECIMAL(5,2)) AS Confidence
+FROM dbo.IdentityScorecard GROUP BY SchemaName, TableName, AppliesToOwner
+) x
+)
+UPDATE ip SET
+ip.V10Winner = ws.V10Winner,
+ip.ConfidenceScore = ws.ConfidenceScore,
+ip.ClassificationTier = ws.ClassificationTier,
+ip.EvidenceCount = (SELECT COUNT(*) FROM dbo.IdentityScorecard isc WHERE isc.SchemaName = ip.SchemaName AND isc.TableName = ip.TableName),
+ip.EvidenceBreadth = ws.EvidenceBreadth,
+ip.NetScore = ws.NetScore,
+ip.PositiveScore = ws.PositiveScore,
+ip.NegativeScore = ws.NegativeScore,
+ip.TopPositiveKey = (SELECT TOP 1 EvidenceKey FROM dbo.IdentityScorecard isc WHERE isc.SchemaName = ip.SchemaName AND isc.TableName = ip.TableName AND isc.WeightedScore > 0 ORDER BY isc.WeightedScore DESC),
+ip.TopNegativeKey = (SELECT TOP 1 EvidenceKey FROM dbo.IdentityScorecard isc WHERE isc.SchemaName = ip.SchemaName AND isc.TableName = ip.TableName AND isc.WeightedScore < 0 ORDER BY isc.WeightedScore ASC),
+ip.IdentityOwner = CASE WHEN ws.ConfidenceScore >= 70 THEN ws.V10Winner ELSE ip.IdentityOwner END,
+ip.OwnershipRule = CASE WHEN ws.ConfidenceScore >= 70 THEN N'V10_CONFIDENCE_SCORING' ELSE ip.OwnershipRule END,
+ip.ReasonCode = CASE WHEN ws.ConfidenceScore >= 70 THEN N'V10_' + ws.V10Winner ELSE ip.ReasonCode END,
+ip.ReasonText = CASE WHEN ws.ConfidenceScore >= 70 THEN N'V10: Confidence=' + CAST(CAST(ws.ConfidenceScore AS INT) AS NVARCHAR) + N', Tier=' + ws.ClassificationTier + N', Winner=' + ws.V10Winner ELSE ip.ReasonText END,
+-- FIX: IdentityResolution was locked to Pass 1's default (often 'Rekey') and never revisited when V10
+-- overrides ownership. A table V10 now correctly identifies as HO-owned (e.g. genCountryMaster, a lookup
+-- table) must not stay slated for Rekey -- that was Pass 1's catch-all for tables it couldn't classify,
+-- not a real strategy decision. When V10 overrides at >=70 confidence, IdentityResolution is re-derived
+-- from the new owner and the table's graph shape, matching the same rules Pass 1 uses for its own HO/Region
+-- branches (Preserve for HO, IdentityMap for Region-owned-but-exists-in-HO, Preserve otherwise).
+ip.IdentityResolution = CASE WHEN ws.ConfidenceScore >= 70 THEN
+    CASE
+        WHEN ws.V10Winner = N'HO' THEN N'Preserve'
+        WHEN ws.V10Winner = N'Region' AND ISNULL(ip.ExistsInHO,0) = 0 THEN N'Preserve'
+        WHEN ws.V10Winner = N'Region' AND ISNULL(ip.ExistsInHO,0) = 1 THEN N'IdentityMap'
+        WHEN ws.V10Winner = N'Shared' THEN N'Merge'
+        ELSE ip.IdentityResolution
+    END
+ELSE ip.IdentityResolution END
+FROM dbo.IdentityPlan ip
+JOIN WinnerScores ws ON ws.SchemaName = ip.SchemaName AND ws.TableName = ip.TableName
+WHERE ws.OwnerRank = 1;
+-- V10.7.5: Safety net for tables still Unknown/Generated after V10 scoring (confidence never crossed 70).
+-- Pass 1's catch-all default routed these to IdentityResolution=Rekey, which silently treats "we could not
+-- prove ownership" as "safe to destructively rekey the PK". That is not a defensible default. Anything still
+-- unresolved is switched to Preserve (non-destructive) and marked PENDING_REVIEW so a human decides instead
+-- of the migration proceeding on an unproven assumption.
+UPDATE ip SET ip.IdentityResolution = N'Preserve', ip.ReasonText = ip.ReasonText + N' | V10.7.5: Unresolved ownership -- forced to Preserve, flagged for review instead of Rekey.'
+FROM dbo.IdentityPlan ip
+WHERE ip.IdentityOwner IN (N'Unknown', N'Generated') AND ip.IdentityResolution = N'Rekey';
+-- V10.8: Quality metrics (FIXED: ISNULL for MetricValue)
+DECLARE @RunId UNIQUEIDENTIFIER = NEWID();
+INSERT INTO dbo.PlannerQualityMetrics (RunId, MetricName, MetricValue, Threshold, Status, Details)
+SELECT @RunId, N'AVG_CONFIDENCE',
+ISNULL(AVG(ConfidenceScore), 0),  -- FIX: ISNULL for NULL AVG
+60.0,
+CASE WHEN ISNULL(AVG(ConfidenceScore), 0) >= 60.0 THEN N'PASS' ELSE N'WARN' END,
+N'Average confidence score'
+FROM dbo.IdentityPlan WHERE V10Winner IS NOT NULL;
+INSERT INTO dbo.PlannerQualityMetrics (RunId, MetricName, MetricValue, Threshold, Status, Details)
+SELECT @RunId, N'UNKNOWN_PCT',
+ISNULL(100.0 * SUM(CASE WHEN ClassificationTier = N'UNKNOWN' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 0),  -- FIX: ISNULL
+10.0,
+CASE WHEN ISNULL(100.0 * SUM(CASE WHEN ClassificationTier = N'UNKNOWN' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 0) <= 10.0 THEN N'PASS' ELSE N'WARN' END,
+N'Percentage of UNKNOWN classification'
+FROM dbo.IdentityPlan WHERE V10Winner IS NOT NULL;
+PRINT N'[MILESTONE 2] V10 Inference Engine Complete.';
+GO
+PRINT N'[PHASE 2.STR] Strategy Plan...';
+IF OBJECT_ID('dbo.StrategyRule','U') IS NOT NULL DROP TABLE dbo.StrategyRule;
+CREATE TABLE dbo.StrategyRule(
+RuleId INT NOT NULL, RuleName NVARCHAR(64) NOT NULL, Priority INT NOT NULL,
+IsActive BIT NOT NULL DEFAULT 1, IdentityOwner NVARCHAR(32) NULL,
+IdentityResolution NVARCHAR(32) NULL, WinnerCategory NVARCHAR(32) NULL,
+CompositePK BIT NULL, HasBranchId BIT NULL, IsGuidPK BIT NULL,
+IsNumericPK BIT NULL, IsStringPK BIT NULL, NoPK BIT NULL,
+HasUnsupportedPK BIT NULL, HasNaturalKeyPK BIT NULL,
+HasNaturalKeyCandidate BIT NULL, HasMergeToMasterEligible BIT NULL,
+HasSmallConfigTable BIT NULL, HasIncomingFK BIT NULL, HasMasterKey BIT NULL,
+IdentityEntity NVARCHAR(64) NULL, ExistsInHO BIT NULL, ExistsInRegion BIT NULL,
+SourcePolicy NVARCHAR(32) NULL,
+UniquenessStrategy NVARCHAR(32) NOT NULL, MigrationStrategy NVARCHAR(32) NOT NULL,
+CompositeScenarioId INT NOT NULL DEFAULT 0,
+PKType NVARCHAR(32) NOT NULL DEFAULT N'Unknown',
+RequiredChildAction NVARCHAR(64) NOT NULL DEFAULT N'None',
+IsUnsupported BIT NOT NULL DEFAULT 0, UnsupportedReason NVARCHAR(256) NULL,
+StrategyRule NVARCHAR(64) NOT NULL, ReasonCode NVARCHAR(64) NOT NULL,
+ReasonText NVARCHAR(512) NOT NULL, Confidence INT NOT NULL DEFAULT 50,
+CONSTRAINT PK_SR PRIMARY KEY(RuleId));
+
+INSERT INTO dbo.StrategyRule VALUES
+(100,N'Unsupported PK',100,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'Unsupported',N'Block',8,N'Unknown',N'None',1,N'Computed/Spatial/XML PK',N'UNSUPPORTED_PK',N'STRAT_UNSUPPORTED',N'Unsupported PK type blocks migration',100),
+(150,N'HO_ONLY Guard',150,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'HO_ONLY',N'Preserve',N'Preserve',11,N'Single',N'None',0,NULL,N'HO_ONLY_GUARD',N'STRAT_HO_ONLY_GUARD',N'HO_ONLY source policy blocks REKEY/EXPAND_PK unconditionally',99),
+(200,N'HO Preserve',200,1,N'HO',N'Preserve',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL,NULL,N'Preserve',N'Preserve',11,N'Single',N'RewriteValues',0,NULL,N'HO_PRESERVE',N'STRAT_HO_PRESERVE',N'HO identity -- Preserve PK',95),
+(210,N'HO MergeToMaster',210,1,N'HO',N'IdentityMap',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,N'Preserve',N'MergeToMaster',12,N'Single',N'RewriteValues',0,NULL,N'HO_IDENTITY_MAP',N'STRAT_HO_MAP',N'HO identity -- MergeToMaster',95),
+(300,N'GUID PK',300,1,NULL,NULL,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'Preserve',N'Append',5,N'Guid',N'None',0,NULL,N'GUID_PK',N'STRAT_GUID',N'GUID PK -- append only',95),
+(400,N'Composite Branch',400,1,NULL,NULL,NULL,1,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'Preserve',N'Append',1,N'Composite',N'ExpandFK',0,NULL,N'COMPOSITE_BRANCH',N'STRAT_COMP_BRANCH',N'Composite PK + BranchId',90),
+(500,N'Natural Key Merge',500,1,NULL,NULL,N'Lookup',NULL,NULL,NULL,NULL,NULL,NULL,NULL,1,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'MergeNatural',N'MergeLookup',6,N'Natural',N'None',0,NULL,N'NATURAL_KEY_MERGE',N'STRAT_NATURAL',N'Natural key -> merge',80),
+(600,N'Region Rekey',600,1,N'Region',NULL,NULL,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'Rekey',N'Rekey',4,N'Single',N'RewriteValues',0,NULL,N'REGION_REKEY',N'STRAT_REGION_REKEY',N'Region numeric -> Rekey',80),
+(700,N'Numeric Rekey',700,1,NULL,NULL,NULL,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'Rekey',N'Rekey',4,N'Single',N'RewriteValues',0,NULL,N'NUMERIC_REKEY',N'STRAT_NUMERIC_REKEY',N'Numeric PK -> Rekey',60),
+(900,N'Composite ExpandPK',900,1,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'ExpandPK',N'ExpandPK',3,N'Composite',N'ExpandFK',0,NULL,N'COMPOSITE_EXPAND',N'STRAT_COMP_EXPAND',N'Composite -> ExpandPK',70),
+(1000,N'No PK Append',1000,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'GenerateSurrogate',N'Append',7,N'None',N'None',0,NULL,N'NO_PK',N'STRAT_NO_PK',N'No PK -> append',60),
+(9000,N'Default',9000,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,N'Preserve',N'Append',11,N'Unknown',N'None',0,NULL,N'DEFAULT',N'STRAT_DEFAULT',N'Default preserve',40);
+
+IF OBJECT_ID('dbo.StrategyPlan','U') IS NOT NULL DROP TABLE dbo.StrategyPlan;
+CREATE TABLE dbo.StrategyPlan(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,UniquenessStrategy NVARCHAR(32) NOT NULL,MigrationStrategy NVARCHAR(32) NOT NULL,CompositeScenarioId INT NOT NULL DEFAULT 0,PKType NVARCHAR(32) NOT NULL,RequiredChildAction NVARCHAR(64) NOT NULL DEFAULT N'None',IsUnsupported BIT NOT NULL DEFAULT 0,UnsupportedReason NVARCHAR(256) NULL,StrategyRule NVARCHAR(64) NOT NULL,ReasonCode NVARCHAR(64) NOT NULL,ReasonText NVARCHAR(512) NOT NULL,Confidence INT NOT NULL DEFAULT 0,RuleId INT NULL,CONSTRAINT PK_StrategyPlan PRIMARY KEY(SchemaName,TableName));
+
+DECLARE @TemplateDB SYSNAME=dbo.GetTemplateDB();
+IF OBJECT_ID('tempdb..#SPI')IS NOT NULL DROP TABLE #SPI;
+SELECT td.SchemaName,td.TableName,ip.IdentityOwner,ip.IdentityResolution,ip.IdentityEntity,ip.HasMasterKey,cp.WinnerCategory,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.TablePKColumns pk JOIN dbo.TableColumns c ON pk.DatabaseName=c.DatabaseName AND pk.SchemaName=c.SchemaName AND pk.TableName=c.TableName AND pk.ColumnName=c.ColumnName WHERE pk.DatabaseName=@TemplateDB AND pk.SchemaName=td.SchemaName AND pk.TableName=td.TableName AND(c.IsComputed=1 OR c.DataType IN('hierarchyid','geography','geometry','xml','sql_variant')))THEN 1 ELSE 0 END AS HasUnsupportedPK,
+td.CompositePK,td.HasBranchId,td.IsGuidPK,
+CASE WHEN td.PKDataType IN(N'int',N'bigint',N'smallint',N'tinyint')THEN 1 ELSE 0 END AS IsNumericPK,
+CASE WHEN td.PKDataType IN(N'varchar',N'nvarchar',N'char',N'nchar')THEN 1 ELSE 0 END AS IsStringPK,
+CASE WHEN td.PKDataType IS NULL THEN 1 ELSE 0 END AS NoPK,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.TablePKColumns pk JOIN dbo.TableColumns tc ON pk.DatabaseName=tc.DatabaseName AND pk.SchemaName=tc.SchemaName AND pk.TableName=tc.TableName AND pk.ColumnName=tc.ColumnName WHERE pk.DatabaseName=@TemplateDB AND pk.SchemaName=td.SchemaName AND pk.TableName=td.TableName AND pk.Ordinal=1 AND tc.DataType IN(N'varchar',N'nvarchar',N'char',N'nchar'))THEN 1 ELSE 0 END AS HasNaturalKeyPK,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.NaturalKeyCandidates nk WHERE nk.SchemaName=td.SchemaName AND nk.TableName=td.TableName)THEN 1 ELSE 0 END AS HasNaturalKeyCandidate,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.TableEvidence te WHERE te.SchemaName=td.SchemaName AND te.TableName=td.TableName AND te.SignalName=N'IsMergeToMasterEligible' AND te.BooleanValue=1)THEN 1 ELSE 0 END AS HasMergeToMasterEligible,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.TableEvidence te WHERE te.SchemaName=td.SchemaName AND te.TableName=td.TableName AND te.SignalName=N'SmallConfigTable' AND te.BooleanValue=1)THEN 1 ELSE 0 END AS HasSmallConfigTable,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.TableEvidence te WHERE te.SchemaName=td.SchemaName AND te.TableName=td.TableName AND te.SignalName=N'IncomingFK' AND te.IntegerValue>0)THEN 1 ELSE 0 END AS HasIncomingFK,
+ISNULL(ip.ExistsInHO,0) AS ExistsInHO, ISNULL(ip.ExistsInRegion,0) AS ExistsInRegion,
+spp.SourcePolicy
+INTO #SPI
+FROM dbo.TableDetails td
+JOIN dbo.IdentityPlan ip ON ip.SchemaName=td.SchemaName AND ip.TableName=td.TableName
+JOIN dbo.CategoryPlan cp ON cp.SchemaName=td.SchemaName AND cp.TableName=td.TableName
+JOIN dbo.SourcePolicyPlan spp ON spp.SchemaName=td.SchemaName AND spp.TableName=td.TableName
+WHERE td.DatabaseName=@TemplateDB;
+
+WITH StrategyRuleMatches AS (
+SELECT sp.SchemaName,sp.TableName,r.UniquenessStrategy,r.MigrationStrategy,r.CompositeScenarioId,r.PKType,r.RequiredChildAction,
+r.IsUnsupported,r.UnsupportedReason,r.StrategyRule,r.ReasonCode,r.ReasonText,r.Confidence,r.RuleId,
+ROW_NUMBER() OVER(PARTITION BY sp.SchemaName, sp.TableName ORDER BY r.Priority) AS rn
+FROM #SPI sp
+JOIN dbo.StrategyRule r ON r.IsActive=1
+AND (r.IdentityOwner IS NULL OR r.IdentityOwner=sp.IdentityOwner)
+AND (r.IdentityResolution IS NULL OR r.IdentityResolution=sp.IdentityResolution)
+AND (r.WinnerCategory IS NULL OR r.WinnerCategory=sp.WinnerCategory)
+AND (r.CompositePK IS NULL OR r.CompositePK=sp.CompositePK)
+AND (r.HasBranchId IS NULL OR r.HasBranchId=sp.HasBranchId)
+AND (r.IsGuidPK IS NULL OR r.IsGuidPK=sp.IsGuidPK)
+AND (r.IsNumericPK IS NULL OR r.IsNumericPK=sp.IsNumericPK)
+AND (r.IsStringPK IS NULL OR r.IsStringPK=sp.IsStringPK)
+AND (r.NoPK IS NULL OR r.NoPK=sp.NoPK)
+AND (r.HasUnsupportedPK IS NULL OR r.HasUnsupportedPK=sp.HasUnsupportedPK)
+AND (r.HasNaturalKeyPK IS NULL OR r.HasNaturalKeyPK=sp.HasNaturalKeyPK)
+AND (r.HasNaturalKeyCandidate IS NULL OR r.HasNaturalKeyCandidate=sp.HasNaturalKeyCandidate)
+AND (r.HasMergeToMasterEligible IS NULL OR r.HasMergeToMasterEligible=sp.HasMergeToMasterEligible)
+AND (r.HasSmallConfigTable IS NULL OR r.HasSmallConfigTable=sp.HasSmallConfigTable)
+AND (r.HasIncomingFK IS NULL OR r.HasIncomingFK=sp.HasIncomingFK)
+AND (r.HasMasterKey IS NULL OR r.HasMasterKey=sp.HasMasterKey)
+AND (r.ExistsInHO IS NULL OR r.ExistsInHO=sp.ExistsInHO)
+AND (r.ExistsInRegion IS NULL OR r.ExistsInRegion=sp.ExistsInRegion)
+AND (r.SourcePolicy IS NULL OR r.SourcePolicy=sp.SourcePolicy)
+)
+INSERT INTO dbo.StrategyPlan SELECT SchemaName,TableName,UniquenessStrategy,MigrationStrategy,CompositeScenarioId,PKType,RequiredChildAction,IsUnsupported,UnsupportedReason,StrategyRule,ReasonCode,ReasonText,Confidence,RuleId FROM StrategyRuleMatches WHERE rn=1;
+
+DECLARE @StratRows INT = @@ROWCOUNT;  -- ═══ FIX: Capture @@ROWCOUNT immediately ═══
+DROP TABLE #SPI;
+DECLARE @msg NVARCHAR(MAX)=N'[PHASE 2.STR] StrategyPlan: '+CAST(@StratRows AS NVARCHAR)+N' tables.'; PRINT @msg;
+SELECT MigrationStrategy,COUNT(*)AS T FROM dbo.StrategyPlan GROUP BY MigrationStrategy ORDER BY COUNT(*)DESC;
+GO
+
+-- PHASE 4-9: MIGRATION ANALYSIS, KEY STRATEGY, EXECUTION
+-- ═══════════════════════════════════════════════════════════════════
+PRINT N'[PHASE 4/9] Migration Analysis...';
+IF OBJECT_ID('dbo.MigrationAnalysis','U') IS NOT NULL DROP TABLE dbo.MigrationAnalysis;
+CREATE TABLE dbo.MigrationAnalysis(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,WinnerCategory NVARCHAR(32) NULL,RunnerUpCategory NVARCHAR(32) NULL,WinnerScore INT NULL,RunnerUpScore INT NULL,ScoreDifferential INT NULL,EvidenceStrength INT NULL,ContradictionCount INT NULL,Confidence INT NULL,ConfidenceLevel NVARCHAR(16) NULL,IsUncertain BIT NULL,UniquenessStrategy NVARCHAR(32) NOT NULL,MigrationStrategy NVARCHAR(32) NOT NULL,CompositeScenarioId INT NOT NULL,PKType NVARCHAR(32) NOT NULL,RequiredChildAction NVARCHAR(64) NOT NULL,IsUnsupported BIT NOT NULL DEFAULT(0),UnsupportedReason NVARCHAR(256) NULL,IsManualOverride BIT NOT NULL DEFAULT(0),OverrideReason NVARCHAR(512) NULL,IdentityReason NVARCHAR(512) NULL,CategoryReason NVARCHAR(512) NULL,StrategyReason NVARCHAR(512) NULL,PolicyReason NVARCHAR(512) NULL,ClassificationReason NVARCHAR(MAX) NULL,SourcePolicy NVARCHAR(32) NULL,BusinessOwner NVARCHAR(32) NULL,MasterKeyColumn NVARCHAR(256) NULL,MasterEntity NVARCHAR(64) NULL,MasterConfidence INT NULL,GovernanceStatus NVARCHAR(32) NULL,CONSTRAINT PK_MA PRIMARY KEY(SchemaName,TableName));
+INSERT INTO dbo.MigrationAnalysis(SchemaName,TableName,WinnerCategory,RunnerUpCategory,WinnerScore,RunnerUpScore,ScoreDifferential,EvidenceStrength,ContradictionCount,Confidence,ConfidenceLevel,IsUncertain,UniquenessStrategy,MigrationStrategy,CompositeScenarioId,PKType,RequiredChildAction,IsUnsupported,UnsupportedReason,IsManualOverride,OverrideReason,IdentityReason,CategoryReason,StrategyReason,PolicyReason,ClassificationReason,SourcePolicy,BusinessOwner,MasterKeyColumn,MasterEntity,MasterConfidence,GovernanceStatus)
+SELECT ip.SchemaName,ip.TableName,cp.WinnerCategory,cp.RunnerUpCategory,cp.WinnerScore,cp.RunnerUpScore,cp.ScoreDifference,cp.EvidenceStrength,cp.ContradictionCount,
+CASE WHEN cp.WinnerScore<=0 THEN 0 WHEN cp.WinnerScore+ABS(cp.WinnerScore-ISNULL(cp.RunnerUpScore,0))>100 THEN 100 ELSE cp.WinnerScore+ABS(cp.WinnerScore-ISNULL(cp.RunnerUpScore,0)) END,
+CASE WHEN cp.WinnerScore<=0 THEN N'None' WHEN cp.WinnerScore+ABS(cp.WinnerScore-ISNULL(cp.RunnerUpScore,0))>=80 THEN N'High' WHEN cp.WinnerScore+ABS(cp.WinnerScore-ISNULL(cp.RunnerUpScore,0))>=50 THEN N'Medium' ELSE N'Low' END,
+CASE WHEN cp.WinnerScore<=0 OR cp.WinnerScore+ABS(cp.WinnerScore-ISNULL(cp.RunnerUpScore,0))<50 THEN 1 ELSE 0 END,
+sp.UniquenessStrategy,sp.MigrationStrategy,sp.CompositeScenarioId,sp.PKType,sp.RequiredChildAction,sp.IsUnsupported,sp.UnsupportedReason,
+CASE WHEN mco.SchemaName IS NOT NULL THEN 1 ELSE 0 END,mco.Reason,
+ip.ReasonText,cp.ReasonText,sp.ReasonText,spp.ReasonText,
+ip.ReasonText+N' | '+cp.ReasonText+N' | '+sp.ReasonText+N' | '+spp.ReasonText,
+spp.SourcePolicy,
+CASE WHEN ip.IdentityAuthority=N'HO' THEN N'HO' WHEN ip.IdentityAuthority=N'Region' THEN N'Region' ELSE ip.IdentityAuthority END,
+ip.MasterKeyColumn,ip.IdentityEntity,
+CASE WHEN ip.HasMasterKey=1 AND ip.IdentityEntity IS NOT NULL THEN 80 ELSE NULL END,
+spp.GovernanceStatus
+FROM dbo.IdentityPlan ip
+JOIN dbo.CategoryPlan cp ON cp.SchemaName=ip.SchemaName AND cp.TableName=ip.TableName
+JOIN dbo.StrategyPlan sp ON sp.SchemaName=ip.SchemaName AND sp.TableName=ip.TableName
+JOIN dbo.SourcePolicyPlan spp ON spp.SchemaName=ip.SchemaName AND spp.TableName=ip.TableName
+LEFT JOIN dbo.ManualClassificationOverride mco ON mco.SchemaName=ip.SchemaName AND mco.TableName=ip.TableName;
+DECLARE @msg NVARCHAR(MAX)=N'[PHASE 4/9] MigrationAnalysis: '+CAST(@@ROWCOUNT AS NVARCHAR)+N' consolidated.'; PRINT @msg;
+GO
+PRINT N'[PHASE 5/9] Key Strategy Plan...';
+IF OBJECT_ID('dbo.KeyStrategyPlan','U') IS NOT NULL DROP TABLE dbo.KeyStrategyPlan;
+CREATE TABLE dbo.KeyStrategyPlan(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,UniquenessStrategy NVARCHAR(32) NOT NULL,MigrationStrategy NVARCHAR(32) NOT NULL,MigrationMethod NVARCHAR(32) NOT NULL,IsUnsupported BIT NOT NULL DEFAULT(0),UnsupportedReason NVARCHAR(256) NULL,GovernanceStatus NVARCHAR(32) NULL,MasterKeyColumn NVARCHAR(256) NULL,MasterEntity NVARCHAR(64) NULL,CONSTRAINT PK_KSP PRIMARY KEY(SchemaName,TableName));
+INSERT INTO dbo.KeyStrategyPlan SELECT sp.SchemaName,sp.TableName,sp.UniquenessStrategy,sp.MigrationStrategy,
+CASE WHEN sp.IsUnsupported=1 THEN N'BLOCK' WHEN sp.MigrationStrategy=N'Copy' THEN N'COPY' WHEN sp.MigrationStrategy=N'Preserve' AND spp.SourcePolicy=N'HO_ONLY' THEN N'PRESERVE' WHEN sp.MigrationStrategy=N'MergeToMaster' THEN N'MERGE_TO_MASTER' WHEN sp.MigrationStrategy=N'Preserve' THEN N'PRESERVE' WHEN sp.MigrationStrategy IN(N'MergeLookup',N'MergeNatural')THEN N'MERGE_LOOKUP' WHEN sp.MigrationStrategy=N'Rekey' THEN N'REKEY' WHEN sp.MigrationStrategy=N'ExpandPK' THEN N'EXPAND_PK' WHEN sp.MigrationStrategy=N'Overwrite' THEN N'OVERWRITE' WHEN sp.MigrationStrategy=N'Append' THEN N'INSERT_ONLY' WHEN sp.MigrationStrategy=N'Block' THEN N'BLOCK' ELSE N'PRESERVE' END,
+sp.IsUnsupported,sp.UnsupportedReason,spp.GovernanceStatus,ip.MasterKeyColumn,ip.IdentityEntity
+FROM dbo.StrategyPlan sp JOIN dbo.SourcePolicyPlan spp ON spp.SchemaName=sp.SchemaName AND spp.TableName=sp.TableName JOIN dbo.IdentityPlan ip ON ip.SchemaName=sp.SchemaName AND ip.TableName=sp.TableName;
+DECLARE @msg NVARCHAR(MAX)=N'[PHASE 5/9] KeyStrategyPlan: '+CAST(@@ROWCOUNT AS NVARCHAR)+N' derived.'; PRINT @msg;
+GO
+PRINT N'[PHASE 6/9] Execution Phase Definitions...';
+IF OBJECT_ID('dbo.ExecutionPhaseDefinition','U') IS NOT NULL DROP TABLE dbo.ExecutionPhaseDefinition;
+CREATE TABLE dbo.ExecutionPhaseDefinition(PhaseId INT PRIMARY KEY,PhaseName NVARCHAR(64) NOT NULL,PhaseOrder INT NOT NULL,ExecutionGroup NVARCHAR(32) NOT NULL,Description NVARCHAR(256) NULL);
+INSERT INTO dbo.ExecutionPhaseDefinition VALUES
+(1,N'HO_Anchors',10,N'HO',N'Root master tables owned by HO'),
+(2,N'HO_Masters',20,N'HO',N'HO master tables dependent on anchors'),
+(3,N'Shared_Lookups',30,N'Shared',N'Lookup / config / shared tables'),
+(4,N'Region_Masters',40,N'Region',N'Region-specific master tables'),
+(5,N'Txn_Headers',50,N'Transaction',N'Transaction header tables'),
+(6,N'Txn_Details',60,N'Transaction',N'Transaction detail / line tables'),
+(7,N'Audit_History',70,N'Audit',N'Audit, log, history tables'),
+(8,N'Deferred',80,N'Deferred',N'Needs manual review'),
+(9,N'Unsupported',99,N'Unsupported',N'Cannot migrate automatically');
+GO
+PRINT N'[PHASE 8/9] Rekey, FK Rewrite, PK Expansion...';
+IF OBJECT_ID('dbo.RekeyPlan','U') IS NOT NULL DROP TABLE dbo.RekeyPlan;
+CREATE TABLE dbo.RekeyPlan(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,OldDataType NVARCHAR(32) NOT NULL,NewDataType NVARCHAR(32) NOT NULL,IsUnsupported BIT NOT NULL DEFAULT(0),CONSTRAINT PK_RP PRIMARY KEY(SchemaName,TableName));
+DECLARE @TemplateDB SYSNAME=dbo.GetTemplateDB();
+INSERT INTO dbo.RekeyPlan(SchemaName,TableName,OldDataType,NewDataType,IsUnsupported)
+SELECT sp.SchemaName,sp.TableName,
+CASE WHEN td.PKDataType IN(N'int',N'bigint')THEN N'bigint' ELSE td.PKDataType END,
+CASE WHEN td.PKDataType IN(N'int',N'bigint')THEN N'bigint' ELSE td.PKDataType END,0
+FROM dbo.StrategyPlan sp JOIN dbo.TableDetails td ON td.DatabaseName=@TemplateDB AND td.SchemaName=sp.SchemaName AND td.TableName=sp.TableName
+WHERE sp.UniquenessStrategy=N'Rekey' AND sp.IsUnsupported=0 AND td.PKDataType IN(N'int',N'bigint',N'smallint',N'tinyint');
+IF OBJECT_ID('dbo.PKExpansionColumns','U') IS NOT NULL DROP TABLE dbo.PKExpansionColumns;
+CREATE TABLE dbo.PKExpansionColumns(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,NewColumn NVARCHAR(128) NOT NULL,DataType NVARCHAR(32) NOT NULL,CONSTRAINT PK_PEC PRIMARY KEY(SchemaName,TableName,NewColumn));
+INSERT INTO dbo.PKExpansionColumns SELECT sp.SchemaName,sp.TableName,td.BranchIdColumn,N'int' FROM dbo.StrategyPlan sp JOIN dbo.TableDetails td ON td.DatabaseName=@TemplateDB AND td.SchemaName=sp.SchemaName AND td.TableName=sp.TableName WHERE sp.UniquenessStrategy=N'ExpandPK' AND sp.IsUnsupported=0 AND td.BranchIdColumn IS NOT NULL;
+IF OBJECT_ID('dbo.IDTranslationMap','U') IS NOT NULL DROP TABLE dbo.IDTranslationMap;
+CREATE TABLE dbo.IDTranslationMap(MapId BIGINT IDENTITY PRIMARY KEY,TableName SYSNAME NOT NULL,SourceOrd INT NOT NULL,OldPK DECIMAL(38,0) NOT NULL,NewPK DECIMAL(38,0) NOT NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+CREATE INDEX IX_ITM_Lookup ON dbo.IDTranslationMap(TableName,SourceOrd,OldPK);
+GO
+PRINT N'[PHASE 9/9] Validation & Execution Plans...';
+IF OBJECT_ID('dbo.ValidationPlan','U') IS NOT NULL DROP TABLE dbo.ValidationPlan;
+CREATE TABLE dbo.ValidationPlan(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ValidationType NVARCHAR(32) NOT NULL,ValidationQuery NVARCHAR(MAX) NULL,ExpectedResult NVARCHAR(256) NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT PK_VP PRIMARY KEY(SchemaName,TableName,ValidationType));
+INSERT INTO dbo.ValidationPlan(SchemaName,TableName,ValidationType) SELECT SchemaName,TableName,N'ROW_COUNT_CHECK' FROM dbo.MigrationAnalysis WHERE IsUnsupported=0;
+IF OBJECT_ID('dbo.ExecutionPlan','U') IS NOT NULL DROP TABLE dbo.ExecutionPlan;
+CREATE TABLE dbo.ExecutionPlan(PlanId INT IDENTITY PRIMARY KEY,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,Step NVARCHAR(64) NOT NULL,StepOrder INT NOT NULL,SQLTemplate NVARCHAR(MAX) NULL,Parameters NVARCHAR(MAX) NULL);
+IF OBJECT_ID('dbo.PKExpansionPlan','U') IS NOT NULL DROP TABLE dbo.PKExpansionPlan;
+CREATE TABLE dbo.PKExpansionPlan(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,CONSTRAINT PK_PEP PRIMARY KEY(SchemaName,TableName));
+PRINT N'══════ PIPELINE VALIDATION ══════';
+SELECT N'IdentityPlan' AS P,IdentityOwner AS Dim,COUNT(*) AS R FROM dbo.IdentityPlan GROUP BY IdentityOwner
+UNION ALL SELECT N'CategoryPlan',WinnerCategory,COUNT(*) FROM dbo.CategoryPlan GROUP BY WinnerCategory
+UNION ALL SELECT N'StrategyPlan',MigrationStrategy,COUNT(*) FROM dbo.StrategyPlan GROUP BY MigrationStrategy
+UNION ALL SELECT N'SourcePolicyPlan',SourcePolicy,COUNT(*) FROM dbo.SourcePolicyPlan GROUP BY SourcePolicy ORDER BY P,R DESC;
+SELECT N'Pipeline Completeness' AS Report,
+(SELECT COUNT(*)FROM dbo.IdentityPlan)AS IdentityPlan,
+(SELECT COUNT(*)FROM dbo.CategoryPlan)AS CategoryPlan,
+(SELECT COUNT(*)FROM dbo.StrategyPlan)AS StrategyPlan,
+(SELECT COUNT(*)FROM dbo.SourcePolicyPlan)AS SourcePolicyPlan,
+(SELECT COUNT(*)FROM dbo.MigrationAnalysis)AS MigrationAnalysis,
+(SELECT COUNT(*)FROM dbo.KeyStrategyPlan)AS KeyStrategyPlan;
+GO
+-- ═══════════════════════════════════════════════════════════════════
+-- MILESTONE III: EXECUTION PLANNING ENGINE (Tasks G, H, I)
+-- ═══════════════════════════════════════════════════════════════════
+PRINT N'[MILESTONE III] Execution Planning Engine...';
+DECLARE @TplDB SYSNAME=dbo.GetTemplateDB();
+DECLARE @MstrDB SYSNAME=dbo.GetMasterSourceDB();
+DECLARE @TargetDB SYSNAME;
+SELECT TOP 1 @TargetDB=DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 AND DatabaseRole=N'Target';
+IF @TargetDB IS NULL SET @TargetDB=@TplDB;
+-- TASK G: MergeKeyPlan
+PRINT N'[TASK G] MergeKeyPlan...';
+IF OBJECT_ID('dbo.MergeKeyPlan','U') IS NOT NULL DROP TABLE dbo.MergeKeyPlan;
+CREATE TABLE dbo.MergeKeyPlan(
+MergeKeyId INT IDENTITY PRIMARY KEY, SchemaName SYSNAME NOT NULL, TableName SYSNAME NOT NULL,
+ColumnName NVARCHAR(256) NOT NULL, Ordinal INT NOT NULL DEFAULT 1,
+KeySource NVARCHAR(32) NOT NULL, SourceScope NVARCHAR(16) NOT NULL DEFAULT N'ALL',
+MigrationStrategy NVARCHAR(32) NOT NULL, ComparisonOperator NVARCHAR(8) NOT NULL DEFAULT N'=',
+TargetColumnName NVARCHAR(256) NULL, NullHandling NVARCHAR(16) NOT NULL DEFAULT N'FAIL',
+CandidateIndexName SYSNAME NULL, Confidence INT NOT NULL DEFAULT 50,
+ReasonCode NVARCHAR(64) NOT NULL, ReasonText NVARCHAR(512) NOT NULL,
+CONSTRAINT UQ_MKP UNIQUE(SchemaName,TableName,ColumnName,KeySource,SourceScope));
+-- G.1 PRESERVE → PK columns
+INSERT INTO dbo.MergeKeyPlan(SchemaName,TableName,ColumnName,Ordinal,KeySource,SourceScope,MigrationStrategy,ComparisonOperator,TargetColumnName,NullHandling,Confidence,ReasonCode,ReasonText)
+SELECT sp.SchemaName,sp.TableName,pk.ColumnName,pk.Ordinal,N'PK',N'ALL',sp.MigrationStrategy,N'=',pk.ColumnName,N'FAIL',95,N'PRESERVE_PK',N'PreservePK: PK ['+pk.ColumnName+N']'
+FROM dbo.StrategyPlan sp JOIN dbo.TablePKColumns pk ON pk.DatabaseName=@TplDB AND pk.SchemaName=sp.SchemaName AND pk.TableName=sp.TableName
+WHERE sp.UniquenessStrategy=N'Preserve' AND sp.MigrationStrategy NOT IN(N'MergeToMaster') AND ISNULL(sp.IsUnsupported,0)=0;
+-- G.2 MTM HO anchor
+INSERT INTO dbo.MergeKeyPlan(SchemaName,TableName,ColumnName,Ordinal,KeySource,SourceScope,MigrationStrategy,ComparisonOperator,TargetColumnName,NullHandling,Confidence,ReasonCode,ReasonText)
+SELECT sp.SchemaName,sp.TableName,pk.ColumnName,pk.Ordinal,N'PK',N'HO_ONLY',sp.MigrationStrategy,N'=',pk.ColumnName,N'FAIL',95,N'MTM_HO_ANCHOR',N'MTM HO anchor: PK ['+pk.ColumnName+N']'
+FROM dbo.StrategyPlan sp JOIN dbo.IdentityPlan ip ON ip.SchemaName=sp.SchemaName AND ip.TableName=sp.TableName JOIN dbo.TablePKColumns pk ON pk.DatabaseName=@TplDB AND pk.SchemaName=sp.SchemaName AND pk.TableName=sp.TableName AND pk.Ordinal=1
+WHERE sp.MigrationStrategy=N'MergeToMaster' AND ip.IdentityOwner=N'HO' AND ISNULL(sp.IsUnsupported,0)=0;
+-- G.3 MTM non-HO via MasterKey
+INSERT INTO dbo.MergeKeyPlan(SchemaName,TableName,ColumnName,Ordinal,KeySource,SourceScope,MigrationStrategy,ComparisonOperator,TargetColumnName,NullHandling,Confidence,ReasonCode,ReasonText)
+SELECT sp.SchemaName,sp.TableName,ip.MasterKeyColumn,1,N'MasterKey',N'REGION_ONLY',sp.MigrationStrategy,N'=',COALESCE(pk_m.ColumnName,ip.MasterKeyColumn),N'SKIP',85,N'MTM_VIA_MASTERKEY',N'MTM: src.['+ip.MasterKeyColumn+N'] = tgt.['+ISNULL(COALESCE(pk_m.ColumnName,ip.MasterKeyColumn),N'?')+N']'
+FROM dbo.StrategyPlan sp JOIN dbo.IdentityPlan ip ON ip.SchemaName=sp.SchemaName AND ip.TableName=sp.TableName
+LEFT JOIN dbo.IdentityPlan ip_m ON ip_m.IdentityEntity=ip.IdentityEntity AND ip_m.IdentityOwner=N'HO' AND ip_m.IdentityAnchor=1
+LEFT JOIN dbo.TablePKColumns pk_m ON pk_m.DatabaseName=@TplDB AND pk_m.SchemaName=ip_m.SchemaName AND pk_m.TableName=ip_m.TableName AND pk_m.Ordinal=1
+WHERE sp.MigrationStrategy=N'MergeToMaster' AND ISNULL(sp.IsUnsupported,0)=0 AND ip.IdentityOwner<>N'HO' AND ip.MasterKeyColumn IS NOT NULL;
+-- G.4 REKEY → old PK
+INSERT INTO dbo.MergeKeyPlan(SchemaName,TableName,ColumnName,Ordinal,KeySource,SourceScope,MigrationStrategy,ComparisonOperator,TargetColumnName,NullHandling,Confidence,ReasonCode,ReasonText)
+SELECT sp.SchemaName,sp.TableName,pk.ColumnName,pk.Ordinal,N'PK',N'ALL',sp.MigrationStrategy,N'=',pk.ColumnName,N'FAIL',70,N'REKEY_OLD_PK',N'Rekey: old PK ['+pk.ColumnName+N']'
+FROM dbo.StrategyPlan sp JOIN dbo.TablePKColumns pk ON pk.DatabaseName=@TplDB AND pk.SchemaName=sp.SchemaName AND pk.TableName=sp.TableName
+WHERE sp.UniquenessStrategy=N'Rekey' AND sp.MigrationStrategy NOT IN(N'MergeToMaster') AND ISNULL(sp.IsUnsupported,0)=0;
+-- G.5 EXPAND_PK → original PK + BranchId
+INSERT INTO dbo.MergeKeyPlan(SchemaName,TableName,ColumnName,Ordinal,KeySource,SourceScope,MigrationStrategy,ComparisonOperator,TargetColumnName,NullHandling,Confidence,ReasonCode,ReasonText)
+SELECT sp.SchemaName,sp.TableName,pk.ColumnName,pk.Ordinal,N'Composite',N'ALL',sp.MigrationStrategy,N'=',pk.ColumnName,N'FAIL',85,N'EXPAND_PK_COL',N'ExpandPK: original PK ['+pk.ColumnName+N']'
+FROM dbo.StrategyPlan sp JOIN dbo.TablePKColumns pk ON pk.DatabaseName=@TplDB AND pk.SchemaName=sp.SchemaName AND pk.TableName=sp.TableName
+WHERE sp.UniquenessStrategy=N'ExpandPK' AND ISNULL(sp.IsUnsupported,0)=0;
+INSERT INTO dbo.MergeKeyPlan(SchemaName,TableName,ColumnName,Ordinal,KeySource,SourceScope,MigrationStrategy,ComparisonOperator,TargetColumnName,NullHandling,Confidence,ReasonCode,ReasonText)
+SELECT sp.SchemaName,sp.TableName,N'BranchId',ISNULL((SELECT MAX(Ordinal)+1 FROM dbo.TablePKColumns WHERE DatabaseName=@TplDB AND SchemaName=sp.SchemaName AND TableName=sp.TableName),1),N'Composite',N'ALL',sp.MigrationStrategy,N'=',N'BranchId',N'FAIL',90,N'EXPAND_PK_BRANCH',N'ExpandPK: BranchId appended'
+FROM dbo.StrategyPlan sp WHERE sp.UniquenessStrategy=N'ExpandPK' AND ISNULL(sp.IsUnsupported,0)=0
+AND NOT EXISTS(SELECT 1 FROM dbo.MergeKeyPlan mkp WHERE mkp.SchemaName=sp.SchemaName AND mkp.TableName=sp.TableName AND mkp.ColumnName=N'BranchId');
+-- G.6 Fallback PK
+INSERT INTO dbo.MergeKeyPlan(SchemaName,TableName,ColumnName,Ordinal,KeySource,SourceScope,MigrationStrategy,ComparisonOperator,TargetColumnName,NullHandling,Confidence,ReasonCode,ReasonText)
+SELECT ksp.SchemaName,ksp.TableName,pk.ColumnName,pk.Ordinal,N'PK',N'ALL',ksp.MigrationStrategy,N'=',pk.ColumnName,N'FAIL',30,N'PK_FALLBACK',N'PK fallback. REVIEW REQUIRED.'
+FROM dbo.KeyStrategyPlan ksp JOIN dbo.TablePKColumns pk ON pk.DatabaseName=@TplDB AND pk.SchemaName=ksp.SchemaName AND pk.TableName=ksp.TableName AND pk.Ordinal=1
+WHERE ISNULL(ksp.IsUnsupported,0)=0 AND NOT EXISTS(SELECT 1 FROM dbo.MergeKeyPlan mkp WHERE mkp.SchemaName=ksp.SchemaName AND mkp.TableName=ksp.TableName);
+DECLARE @msg NVARCHAR(MAX)=N'[TASK G] MergeKeyPlan: '+CAST((SELECT COUNT(*) FROM dbo.MergeKeyPlan) AS NVARCHAR)+N' keys.'; PRINT @msg;
+GO
+-- TASK H: MigrationExecutionContract
+PRINT N'[TASK H] MigrationExecutionContract...';
+IF OBJECT_ID('dbo.MigrationSourcePlan','U') IS NOT NULL DROP TABLE dbo.MigrationSourcePlan;
+IF OBJECT_ID('dbo.MigrationExecutionContract','U') IS NOT NULL DROP TABLE dbo.MigrationExecutionContract;
+CREATE TABLE dbo.MigrationExecutionContract(
+ContractId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID(), SchemaName SYSNAME NOT NULL, TableName SYSNAME NOT NULL,
+MigrationMethod NVARCHAR(32) NOT NULL, MigrationStrategy NVARCHAR(32) NOT NULL, UniquenessStrategy NVARCHAR(32) NOT NULL,
+ExecutionPhaseId INT NOT NULL, ExecutionPhase NVARCHAR(64) NOT NULL, ExecutionGroup NVARCHAR(32) NOT NULL,
+ExecutionOrder INT NOT NULL, SourcePolicy NVARCHAR(32) NOT NULL, FKRewrite BIT NOT NULL DEFAULT 0,
+TranslationRequired BIT NOT NULL DEFAULT 0, GovernanceStatus NVARCHAR(32) NOT NULL DEFAULT N'APPROVED',
+MergeKey BIT NOT NULL DEFAULT 0, IdentityOwner NVARCHAR(32) NOT NULL DEFAULT N'Unknown',
+IdentityResolution NVARCHAR(32) NULL, WinnerCategory NVARCHAR(32) NULL, FKDepth INT NOT NULL DEFAULT 99,
+MergePriority INT NOT NULL DEFAULT 50, IsUnsupported BIT NOT NULL DEFAULT 0, UnsupportedReason NVARCHAR(512) NULL,
+RequiredChildAction NVARCHAR(32) NULL, ExpectedCategory NVARCHAR(32) NULL, ExpectedStrategy NVARCHAR(32) NULL,
+ExpectedSourcePolicy NVARCHAR(32) NULL, ExpectedMigrationMethod NVARCHAR(32) NULL, ExpectedMasterEntity NVARCHAR(64) NULL,
+ManualOverride BIT NOT NULL DEFAULT 0, OverrideReason NVARCHAR(512) NULL, RetryPolicy NVARCHAR(32) NULL,
+CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+CONSTRAINT PK_MEC PRIMARY KEY(ContractId), CONSTRAINT UQ_MEC UNIQUE(SchemaName,TableName));
+DECLARE @TplDB SYSNAME=dbo.GetTemplateDB();
+;WITH Base AS(
+SELECT ksp.SchemaName,ksp.TableName,ksp.MigrationStrategy,ksp.UniquenessStrategy,
+ISNULL(ksp.IsUnsupported,0) AS IsUnsup, ISNULL(ksp.GovernanceStatus,N'') AS GovStatus,
+ksp.MasterKeyColumn, ksp.MasterEntity,
+ISNULL(ip.IdentityOwner,N'Unknown') AS IdOwner, ip.IdentityResolution AS IdRes,
+ip.IdentityAnchor AS IsAnchor, ip.IdentityEntity, ip.IdentityParent, ip.TotalIncomingRefs,
+ISNULL(cp.WinnerCategory,N'Unknown') AS WCat, ISNULL(spp.SourcePolicy,N'BOTH') AS SPol,
+ISNULL(spp.MergePriority,50) AS MPri, ISNULL(dg.FKDepth,99) AS FKD, ISNULL(dg.IsHub,0) AS Hub,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.MergeKeyPlan m WHERE m.SchemaName=ksp.SchemaName AND m.TableName=ksp.TableName) THEN 1 ELSE 0 END AS HasMK,
+ec.ExpectedCategory, ec.ExpectedStrategy, ec.ExpectedSourcePolicy, ec.ExpectedMigrationMethod, ec.ExpectedMasterEntity,
+mco.SchemaName AS MCOSch, mco.ForcedStrategy, mco.ForcedMigrationStrategy, mco.ForcedUnsupported, mco.Reason AS MCOReason
+FROM dbo.KeyStrategyPlan ksp
+LEFT JOIN dbo.IdentityPlan ip ON ip.SchemaName=ksp.SchemaName AND ip.TableName=ksp.TableName
+LEFT JOIN dbo.CategoryPlan cp ON cp.SchemaName=ksp.SchemaName AND cp.TableName=ksp.TableName
+LEFT JOIN dbo.SourcePolicyPlan spp ON spp.SchemaName=ksp.SchemaName AND spp.TableName=ksp.TableName
+LEFT JOIN dbo.DependencyGraph dg ON dg.SchemaName=ksp.SchemaName AND dg.TableName=ksp.TableName
+LEFT JOIN dbo.ExpectedClassification ec ON ec.SchemaName=ksp.SchemaName AND ec.TableName=ksp.TableName
+LEFT JOIN dbo.ManualClassificationOverride mco ON mco.SchemaName=ksp.SchemaName AND mco.TableName=ksp.TableName),
+Comp AS(
+SELECT *,
+CASE
+WHEN IsUnsup=1 OR MigrationStrategy=N'Unsupported' THEN 9
+WHEN IdOwner=N'HO' AND IsAnchor=1 THEN 1
+WHEN IdOwner=N'HO' AND WCat=N'Master' THEN 2
+WHEN IdOwner=N'HO' AND MigrationStrategy=N'MergeToMaster' THEN 2
+WHEN WCat IN(N'Lookup',N'Configuration') THEN 3
+WHEN IdOwner IN(N'Shared',N'Generated') THEN 3
+WHEN WCat=N'Master' AND IdOwner NOT IN(N'HO',N'Unknown') THEN 4
+WHEN WCat=N'TransactionHeader' THEN 5
+WHEN WCat=N'TransactionDetail' THEN 6
+WHEN WCat=N'Audit' THEN 7
+ELSE 8
+END AS PhId,
+CASE
+WHEN IsUnsup=1 THEN N'UNSUPPORTED'
+WHEN ForcedMigrationStrategy IS NOT NULL THEN ForcedMigrationStrategy
+WHEN MigrationStrategy=N'Copy' THEN N'COPY'
+WHEN MigrationStrategy=N'MergeToMaster' THEN N'MERGE_TO_MASTER'
+WHEN UniquenessStrategy=N'Preserve' THEN N'PRESERVE'
+WHEN UniquenessStrategy=N'Rekey' THEN N'REKEY'
+WHEN UniquenessStrategy=N'ExpandPK' THEN N'EXPAND_PK'
+WHEN MigrationStrategy=N'MergeNatural' THEN N'MERGE_LOOKUP'
+WHEN MigrationStrategy=N'Append' THEN N'INSERT_ONLY'
+WHEN UniquenessStrategy=N'GenerateSurrogate' THEN N'INSERT_ONLY'
+ELSE N'REKEY'
+END AS MMethod,
+CASE WHEN UniquenessStrategy=N'ExpandPK' AND EXISTS(SELECT 1 FROM dbo.TableFKDetails fk WHERE fk.DatabaseName=@TplDB AND fk.ReferencedSchema=Base.SchemaName AND fk.ReferencedTable=Base.TableName AND fk.IsSelfReference=0) THEN 1 ELSE 0 END AS FKRw,
+CASE
+WHEN IsUnsup=1 THEN 0
+WHEN ForcedMigrationStrategy IS NOT NULL AND ForcedMigrationStrategy IN(N'REKEY',N'EXPAND_PK',N'MERGE_TO_MASTER',N'MERGE_LOOKUP') THEN 1
+WHEN IdRes=N'IdentityMap' THEN 1
+WHEN UniquenessStrategy=N'Rekey' THEN 1
+WHEN UniquenessStrategy=N'ExpandPK' THEN 1
+WHEN MigrationStrategy=N'MergeToMaster' AND IdOwner<>N'HO' THEN 1
+ELSE 0
+END AS Trans
+FROM Base)
+INSERT INTO dbo.MigrationExecutionContract(ContractId,SchemaName,TableName,MigrationMethod,MigrationStrategy,UniquenessStrategy,ExecutionPhaseId,ExecutionPhase,ExecutionGroup,ExecutionOrder,SourcePolicy,FKRewrite,TranslationRequired,GovernanceStatus,MergeKey,IdentityOwner,IdentityResolution,WinnerCategory,FKDepth,MergePriority,IsUnsupported,UnsupportedReason,RequiredChildAction,ExpectedCategory,ExpectedStrategy,ExpectedSourcePolicy,ExpectedMigrationMethod,ExpectedMasterEntity,ManualOverride,OverrideReason)
+SELECT NEWID(),c.SchemaName,c.TableName,c.MMethod,c.MigrationStrategy,c.UniquenessStrategy,
+c.PhId, epd.PhaseName, epd.ExecutionGroup,
+c.FKD*1000000+epd.PhaseOrder*100+(100-c.MPri),
+c.SPol, c.FKRw, c.Trans,
+CASE WHEN c.IsUnsup=1 THEN N'PENDING_REVIEW' WHEN c.GovStatus=N'REJECTED' THEN N'REJECTED' WHEN c.GovStatus=N'PENDING_REVIEW' THEN N'PENDING_REVIEW' ELSE N'APPROVED' END,
+c.HasMK, c.IdOwner, c.IdRes, c.WCat, c.FKD, c.MPri,
+c.IsUnsup, CASE WHEN c.IsUnsup=1 THEN N'Unsupported scenario: '+ISNULL(c.MigrationStrategy,N'?') ELSE NULL END,
+NULL,
+c.ExpectedCategory, c.ExpectedStrategy, c.ExpectedSourcePolicy, c.ExpectedMigrationMethod, c.ExpectedMasterEntity,
+CASE WHEN c.MCOSch IS NOT NULL THEN 1 ELSE 0 END, c.MCOReason
+FROM Comp c JOIN dbo.ExecutionPhaseDefinition epd ON epd.PhaseId=c.PhId;
+-- Apply manual forced-unsupported
+UPDATE mec SET mec.IsUnsupported=1, mec.GovernanceStatus=N'PENDING_REVIEW', mec.ExecutionPhaseId=9, mec.ExecutionPhase=N'Unsupported', mec.ExecutionGroup=N'Unsupported', mec.ExecutionOrder=99*100000+mec.FKDepth*1000, mec.UnsupportedReason=N'Manual override: '+ISNULL(mco.Reason,N'')
+FROM dbo.MigrationExecutionContract mec JOIN dbo.ManualClassificationOverride mco ON mco.SchemaName=mec.SchemaName AND mco.TableName=mec.TableName
+WHERE mco.ForcedUnsupported=1;
+DECLARE @msg NVARCHAR(MAX)=N'[TASK H] MigrationExecutionContract: '+CAST((SELECT COUNT(*) FROM dbo.MigrationExecutionContract) AS NVARCHAR)+N' contracts.'; PRINT @msg;
+GO
+-- ExecutionDependencyPlan
+PRINT N'[SUPPORT] ExecutionDependencyPlan...';
+IF OBJECT_ID('dbo.ExecutionDependencyPlan','U') IS NOT NULL DROP TABLE dbo.ExecutionDependencyPlan;
+CREATE TABLE dbo.ExecutionDependencyPlan(
+DependencyId INT IDENTITY PRIMARY KEY, ParentSchema SYSNAME NOT NULL, ParentTable SYSNAME NOT NULL,
+ChildSchema SYSNAME NOT NULL, ChildTable SYSNAME NOT NULL, DependencyType NVARCHAR(32) NOT NULL,
+ExecutionConstraint NVARCHAR(16) NOT NULL DEFAULT N'Blocking', RequiresTranslation BIT NOT NULL DEFAULT 0,
+ParentPhaseId INT NULL, ChildPhaseId INT NULL, ParentExecutionOrder INT NULL, ChildExecutionOrder INT NULL,
+Reason NVARCHAR(256) NULL, CONSTRAINT UQ_EDP UNIQUE(ParentSchema,ParentTable,ChildSchema,ChildTable,DependencyType));
+DECLARE @TplDB SYSNAME=dbo.GetTemplateDB();
+INSERT INTO dbo.ExecutionDependencyPlan(ParentSchema,ParentTable,ChildSchema,ChildTable,DependencyType,ExecutionConstraint,RequiresTranslation,ParentPhaseId,ChildPhaseId,ParentExecutionOrder,ChildExecutionOrder,Reason)
+SELECT fk.ReferencedSchema,fk.ReferencedTable,fk.SchemaName,fk.TableName,N'FK_DECLARED',
+CASE WHEN MAX(mec_p.ExecutionPhaseId)<>MAX(mec_c.ExecutionPhaseId) THEN N'Blocking' ELSE N'Advisory' END,
+MAX(CASE WHEN mec_p.TranslationRequired=1 THEN 1 ELSE 0 END),
+MAX(mec_p.ExecutionPhaseId),MAX(mec_c.ExecutionPhaseId),MAX(mec_p.ExecutionOrder),MAX(mec_c.ExecutionOrder),
+N'FK: ['+fk.TableName+N'].['+STRING_AGG(fk.FKColumns,N', ')+N'] → ['+fk.ReferencedTable+N']'
+FROM dbo.TableFKDetails fk
+JOIN dbo.MigrationExecutionContract mec_p ON mec_p.SchemaName=fk.ReferencedSchema AND mec_p.TableName=fk.ReferencedTable
+JOIN dbo.MigrationExecutionContract mec_c ON mec_c.SchemaName=fk.SchemaName AND mec_c.TableName=fk.TableName
+WHERE fk.DatabaseName=@TplDB AND fk.IsSelfReference=0 AND mec_p.IsUnsupported=0 AND mec_c.IsUnsupported=0
+GROUP BY fk.ReferencedSchema,fk.ReferencedTable,fk.SchemaName,fk.TableName;
+DECLARE @msg NVARCHAR(MAX)=N'[SUPPORT] ExecutionDependencyPlan: '+CAST((SELECT COUNT(*) FROM dbo.ExecutionDependencyPlan) AS NVARCHAR)+N' dependencies.'; PRINT @msg;
+GO
+-- FKRewritePlan
+PRINT N'[SUPPORT] FKRewritePlan...';
+IF OBJECT_ID('dbo.FKRewritePlan','U') IS NOT NULL DROP TABLE dbo.FKRewritePlan;
+CREATE TABLE dbo.FKRewritePlan(
+RewriteId INT IDENTITY PRIMARY KEY, ParentSchema SYSNAME NOT NULL, ParentTable SYSNAME NOT NULL,
+ChildSchema SYSNAME NOT NULL, ChildTable SYSNAME NOT NULL, ChildColumn NVARCHAR(256) NOT NULL,
+ReferencedColumn NVARCHAR(256) NOT NULL, RewriteType NVARCHAR(32) NOT NULL,
+AddBranchIdToFK BIT NOT NULL DEFAULT 0, ColumnType NVARCHAR(128) NULL, Reason NVARCHAR(256) NULL,
+CONSTRAINT UQ_FRP UNIQUE(ParentSchema,ParentTable,ChildSchema,ChildTable,ChildColumn));
+DECLARE @TplDB SYSNAME=dbo.GetTemplateDB();
+-- ExpandPK children
+INSERT INTO dbo.FKRewritePlan(ParentSchema,ParentTable,ChildSchema,ChildTable,ChildColumn,ReferencedColumn,RewriteType,AddBranchIdToFK,Reason)
+SELECT fk.ReferencedSchema,fk.ReferencedTable,fk.SchemaName,fk.TableName,fk.FKColumns,MAX(fk.ReferencedColumns),N'EXPAND_FK',1,N'ExpandPK: ['+fk.TableName+N'].['+fk.FKColumns+N'] needs BranchId'
+FROM dbo.TableFKDetails fk JOIN dbo.MigrationExecutionContract mec ON mec.SchemaName=fk.ReferencedSchema AND mec.TableName=fk.ReferencedTable
+WHERE fk.DatabaseName=@TplDB AND fk.IsSelfReference=0 AND mec.UniquenessStrategy=N'ExpandPK' AND mec.IsUnsupported=0
+GROUP BY fk.ReferencedSchema,fk.ReferencedTable,fk.SchemaName,fk.TableName,fk.FKColumns;
+-- MTM children
+INSERT INTO dbo.FKRewritePlan(ParentSchema,ParentTable,ChildSchema,ChildTable,ChildColumn,ReferencedColumn,RewriteType,AddBranchIdToFK,Reason)
+SELECT fk.ReferencedSchema,fk.ReferencedTable,fk.SchemaName,fk.TableName,fk.FKColumns,MAX(fk.ReferencedColumns),N'MTM_TRANSLATE',0,N'MTM: ['+fk.TableName+N'].['+fk.FKColumns+N'] needs translation'
+FROM dbo.TableFKDetails fk JOIN dbo.MigrationExecutionContract mec ON mec.SchemaName=fk.ReferencedSchema AND mec.TableName=fk.ReferencedTable
+WHERE fk.DatabaseName=@TplDB AND fk.IsSelfReference=0 AND mec.MigrationMethod=N'MERGE_TO_MASTER' AND mec.TranslationRequired=1 AND mec.IsUnsupported=0
+GROUP BY fk.ReferencedSchema,fk.ReferencedTable,fk.SchemaName,fk.TableName,fk.FKColumns
+HAVING NOT EXISTS(SELECT 1 FROM dbo.FKRewritePlan frp WHERE frp.ParentSchema=fk.ReferencedSchema AND frp.ParentTable=fk.ReferencedTable AND frp.ChildSchema=fk.SchemaName AND frp.ChildTable=fk.TableName AND frp.ChildColumn=fk.FKColumns);
+-- Rekey children
+INSERT INTO dbo.FKRewritePlan(ParentSchema,ParentTable,ChildSchema,ChildTable,ChildColumn,ReferencedColumn,RewriteType,AddBranchIdToFK,Reason)
+SELECT fk.ReferencedSchema,fk.ReferencedTable,fk.SchemaName,fk.TableName,fk.FKColumns,MAX(fk.ReferencedColumns),N'REKEY_TRANSLATE',0,N'Rekey: ['+fk.TableName+N'].['+fk.FKColumns+N'] needs translation'
+FROM dbo.TableFKDetails fk JOIN dbo.MigrationExecutionContract mec ON mec.SchemaName=fk.ReferencedSchema AND mec.TableName=fk.ReferencedTable
+WHERE fk.DatabaseName=@TplDB AND fk.IsSelfReference=0 AND mec.MigrationMethod=N'REKEY' AND mec.TranslationRequired=1 AND mec.IsUnsupported=0
+GROUP BY fk.ReferencedSchema,fk.ReferencedTable,fk.SchemaName,fk.TableName,fk.FKColumns
+HAVING NOT EXISTS(SELECT 1 FROM dbo.FKRewritePlan frp WHERE frp.ParentSchema=fk.ReferencedSchema AND frp.ParentTable=fk.ReferencedTable AND frp.ChildSchema=fk.SchemaName AND frp.ChildTable=fk.TableName AND frp.ChildColumn=fk.FKColumns);
+-- Backfill ColumnType
+UPDATE frp SET frp.ColumnType=COALESCE(rp.NewDataType,
+CASE WHEN tc.DataType IN(N'varchar',N'nvarchar',N'char',N'nchar') THEN tc.DataType+N'('+CASE WHEN tc.MaxLength=-1 THEN N'MAX' ELSE CAST(CASE WHEN tc.DataType IN(N'nvarchar',N'nchar') THEN tc.MaxLength/2 ELSE tc.MaxLength END AS NVARCHAR(10)) END+N')'
+WHEN tc.DataType IN(N'decimal',N'numeric') THEN tc.DataType+N'('+CAST(tc.Precision AS NVARCHAR)+N','+CAST(tc.Scale AS NVARCHAR)+N')'
+ELSE tc.DataType END)
+FROM dbo.FKRewritePlan frp
+LEFT JOIN dbo.RekeyPlan rp ON rp.SchemaName=frp.ParentSchema AND rp.TableName=frp.ParentTable
+LEFT JOIN dbo.TableColumns tc ON tc.DatabaseName=@TplDB AND tc.SchemaName=frp.ChildSchema AND tc.TableName=frp.ChildTable AND tc.ColumnName=frp.ChildColumn;
+DECLARE @msg NVARCHAR(MAX)=N'[SUPPORT] FKRewritePlan: '+CAST((SELECT COUNT(*) FROM dbo.FKRewritePlan) AS NVARCHAR)+N' rewrites.'; PRINT @msg;
+GO
+-- ValidationPlan stubs
+PRINT N'[SUPPORT] ValidationPlan stubs...';
+IF OBJECT_ID('dbo.ValidationPlan','U') IS NOT NULL DROP TABLE dbo.ValidationPlan;
+CREATE TABLE dbo.ValidationPlan(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ValidationType NVARCHAR(32) NOT NULL,ValidationQuery NVARCHAR(MAX) NULL,ExpectedResult NVARCHAR(256) NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT PK_VP PRIMARY KEY(SchemaName,TableName,ValidationType));
+INSERT INTO dbo.ValidationPlan(SchemaName,TableName,ValidationType) SELECT mec.SchemaName,mec.TableName,N'ROW_COUNT_CHECK' FROM dbo.MigrationExecutionContract mec WHERE mec.IsUnsupported=0 AND mec.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED') AND mec.MigrationMethod IN(N'INSERT_ONLY',N'REKEY',N'EXPAND_PK',N'MERGE_TO_MASTER',N'MERGE_LOOKUP',N'OVERWRITE',N'PRESERVE');
+-- TASK I: MigrationSourcePlan
+PRINT N'[TASK I] MigrationSourcePlan...';
+IF OBJECT_ID('dbo.MigrationSourcePlan','U') IS NOT NULL DROP TABLE dbo.MigrationSourcePlan;
+CREATE TABLE dbo.MigrationSourcePlan(
+SourcePlanId INT IDENTITY PRIMARY KEY, ContractId UNIQUEIDENTIFIER NOT NULL, SourceDB SYSNAME NOT NULL,
+TargetDB SYSNAME NOT NULL, SourceSch SYSNAME NOT NULL, TargetSchema SYSNAME NOT NULL,
+SourceTbl SYSNAME NOT NULL, TargetTable SYSNAME NOT NULL, SourcePolicy NVARCHAR(32) NOT NULL,
+SourceRole NVARCHAR(16) NOT NULL, TranslationRequired BIT NOT NULL DEFAULT 0, FKRewrite BIT NOT NULL DEFAULT 0,
+ExecutionOrder INT NOT NULL, SourceOrd INT NOT NULL DEFAULT 1, RekeyBase BIGINT NOT NULL DEFAULT 0,
+Status NVARCHAR(32) NOT NULL DEFAULT N'PENDING',
+CONSTRAINT FK_MSP_Contract FOREIGN KEY(ContractId) REFERENCES dbo.MigrationExecutionContract(ContractId));
+DECLARE @TplDB SYSNAME=dbo.GetTemplateDB();
+DECLARE @MstrDB SYSNAME=dbo.GetMasterSourceDB();
+DECLARE @TargetDB SYSNAME;
+SELECT TOP 1 @TargetDB=DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 AND DatabaseRole=N'Target';
+IF @TargetDB IS NULL SET @TargetDB=@TplDB;
+-- HO source plans
+INSERT INTO dbo.MigrationSourcePlan(ContractId,SourceDB,TargetDB,SourceSch,TargetSchema,SourceTbl,TargetTable,SourcePolicy,SourceRole,TranslationRequired,FKRewrite,ExecutionOrder,SourceOrd,RekeyBase,Status)
+SELECT mec.ContractId,@MstrDB,@TargetDB,mec.SchemaName,mec.SchemaName,mec.TableName,mec.TableName,mec.SourcePolicy,N'HO',0,mec.FKRewrite,mec.ExecutionOrder,1,0,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.TableDetails td WHERE td.DatabaseName=@MstrDB AND td.SchemaName=mec.SchemaName AND td.TableName=mec.TableName AND ISNULL(td.[RowCount],0)>0) THEN N'PENDING' ELSE N'SKIPPED' END
+FROM dbo.MigrationExecutionContract mec WHERE mec.IsUnsupported=0 AND mec.GovernanceStatus NOT IN(N'REJECTED',N'PENDING_REVIEW') AND mec.SourcePolicy IN(N'HO_ONLY',N'BOTH');
+-- Region source plans
+INSERT INTO dbo.MigrationSourcePlan(ContractId,SourceDB,TargetDB,SourceSch,TargetSchema,SourceTbl,TargetTable,SourcePolicy,SourceRole,TranslationRequired,FKRewrite,ExecutionOrder,SourceOrd,RekeyBase,Status)
+SELECT mec.ContractId,dc.DBName,@TargetDB,mec.SchemaName,mec.SchemaName,mec.TableName,mec.TableName,mec.SourcePolicy,N'Region',mec.TranslationRequired,mec.FKRewrite,mec.ExecutionOrder,dc.Ord+10,dc.RekeyBase,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.TableDetails td WHERE td.DatabaseName=dc.DBName AND td.SchemaName=mec.SchemaName AND td.TableName=mec.TableName AND ISNULL(td.[RowCount],0)>0) THEN N'PENDING' ELSE N'SKIPPED' END
+FROM dbo.MigrationExecutionContract mec CROSS JOIN dbo.DiscoveryConfig dc
+WHERE mec.IsUnsupported=0 AND mec.GovernanceStatus NOT IN(N'REJECTED',N'PENDING_REVIEW') AND mec.SourcePolicy IN(N'REGION_ONLY',N'BOTH') AND dc.IsActive=1 AND dc.DatabaseRole=N'Region';
+-- Region SKIPPED for HO_ONLY
+INSERT INTO dbo.MigrationSourcePlan(ContractId,SourceDB,TargetDB,SourceSch,TargetSchema,SourceTbl,TargetTable,SourcePolicy,SourceRole,TranslationRequired,FKRewrite,ExecutionOrder,SourceOrd,RekeyBase,Status)
+SELECT mec.ContractId,dc.DBName,@TargetDB,mec.SchemaName,mec.SchemaName,mec.TableName,mec.TableName,mec.SourcePolicy,N'Region',0,0,mec.ExecutionOrder,dc.Ord+10,dc.RekeyBase,N'SKIPPED'
+FROM dbo.MigrationExecutionContract mec CROSS JOIN dbo.DiscoveryConfig dc
+WHERE mec.IsUnsupported=0 AND mec.GovernanceStatus NOT IN(N'REJECTED',N'PENDING_REVIEW') AND mec.SourcePolicy=N'HO_ONLY' AND dc.IsActive=1 AND dc.DatabaseRole=N'Region';
+DECLARE @msg NVARCHAR(MAX)=N'[TASK I] MigrationSourcePlan: '+CAST((SELECT COUNT(*) FROM dbo.MigrationSourcePlan) AS NVARCHAR)+N' plans.'; PRINT @msg;
+GO
+
+GO
+-- ═══════════════════════════════════════════════════════════════════
+-- MILESTONE IV: EXECUTION PLANNING (Batch, Translation, Manifest)
+-- ═══════════════════════════════════════════════════════════════════
+PRINT N'[MILESTONE IV] Execution Planning...';
+-- M4.1: Migration Batch Planner
+PRINT N'[M4.1] Migration Batch Planner...';
+IF OBJECT_ID('dbo.MigrationBatchConfig','U') IS NOT NULL DROP TABLE dbo.MigrationBatchConfig;
+CREATE TABLE dbo.MigrationBatchConfig(ConfigKey NVARCHAR(64) PRIMARY KEY,ConfigValue NVARCHAR(256) NOT NULL,Description NVARCHAR(512) NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+INSERT INTO dbo.MigrationBatchConfig(ConfigKey,ConfigValue,Description) VALUES(N'RegionBatchSize',N'4',N'Regions per batch'),(N'HOFirstInBatch',N'1',N'HO first in batch 1'),(N'Version',N'M4.V4',N'Version');
+IF OBJECT_ID('dbo.MigrationBatchPlan','U') IS NOT NULL DROP TABLE dbo.MigrationBatchPlan;
+CREATE TABLE dbo.MigrationBatchPlan(BatchPlanId INT IDENTITY PRIMARY KEY,BatchId INT NOT NULL,BatchOrder INT NOT NULL,SourceDB SYSNAME NOT NULL,Role NVARCHAR(32) NOT NULL,IsBase BIT NOT NULL DEFAULT 0,Status NVARCHAR(32) NOT NULL DEFAULT N'PENDING',Notes NVARCHAR(512) NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT UQ_MBP UNIQUE(BatchId,SourceDB));
+DECLARE @RegionBatchSize INT=CAST((SELECT ConfigValue FROM dbo.MigrationBatchConfig WHERE ConfigKey=N'RegionBatchSize') AS INT);
+DECLARE @HODB SYSNAME=(SELECT TOP 1 DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 AND DatabaseRole=N'HO');
+DECLARE @TplDB SYSNAME=dbo.GetTemplateDB();
+IF OBJECT_ID('tempdb..#Reg') IS NOT NULL DROP TABLE #Reg;
+SELECT DBName,ROW_NUMBER() OVER(ORDER BY Ord) AS Seq INTO #Reg FROM dbo.DiscoveryConfig WHERE IsActive=1 AND DatabaseRole=N'Region' ORDER BY Ord;
+DECLARE @TotalReg INT=@@ROWCOUNT;
+DECLARE @TotalBat INT=CASE WHEN @TotalReg=0 THEN 1 WHEN @TotalReg%@RegionBatchSize=0 THEN @TotalReg/@RegionBatchSize ELSE @TotalReg/@RegionBatchSize+1 END;
+INSERT INTO dbo.MigrationBatchPlan(BatchId,BatchOrder,SourceDB,Role,IsBase,Notes) VALUES(1,1,@HODB,N'HO',1,N'HO first.');
+INSERT INTO dbo.MigrationBatchPlan(BatchId,BatchOrder,SourceDB,Role,IsBase,Notes) VALUES(1,0,@TplDB,N'Template',0,N'Schema template.');
+INSERT INTO dbo.MigrationBatchPlan(BatchId,BatchOrder,SourceDB,Role,IsBase,Notes) SELECT 1,Seq+10,DBName,N'Region',0,N'Region batch 1' FROM #Reg WHERE Seq<=@RegionBatchSize;
+DECLARE @Bat INT=2,@Start INT=@RegionBatchSize+1;
+WHILE @Bat<=@TotalBat BEGIN
+INSERT INTO dbo.MigrationBatchPlan(BatchId,BatchOrder,SourceDB,Role,IsBase,Notes) VALUES(@Bat,0,N'BaseMerge',N'BaseMerge',1,N'Accumulated from batches 1..'+CAST(@Bat-1 AS NVARCHAR)+N'.');
+INSERT INTO dbo.MigrationBatchPlan(BatchId,BatchOrder,SourceDB,Role,IsBase,Notes) SELECT @Bat,Seq+10,DBName,N'Region',0,N'Region batch '+CAST(@Bat AS NVARCHAR) FROM #Reg WHERE Seq>=@Start AND Seq<@Start+@RegionBatchSize;
+SET @Start+=@RegionBatchSize; SET @Bat+=1;
+END
+DROP TABLE #Reg;
+DECLARE @msg NVARCHAR(MAX)=N'[M4.1] '+CAST(@TotalReg AS NVARCHAR)+N' region(s) → '+CAST(@TotalBat AS NVARCHAR)+N' batch(es).'; PRINT @msg;
+GO
+-- M4.7: Batch Dependency Plan
+PRINT N'[M4.7] Batch Dependency Plan...';
+IF OBJECT_ID('dbo.BatchDependencyPlan','U') IS NOT NULL DROP TABLE dbo.BatchDependencyPlan;
+CREATE TABLE dbo.BatchDependencyPlan(DependencyId INT IDENTITY PRIMARY KEY,BatchId INT NOT NULL,DependsOnBatch INT NOT NULL,DependencyType NVARCHAR(32) NOT NULL,Reason NVARCHAR(256) NOT NULL,CONSTRAINT UQ_BDP UNIQUE(BatchId,DependsOnBatch,DependencyType));
+INSERT INTO dbo.BatchDependencyPlan(BatchId,DependsOnBatch,DependencyType,Reason) SELECT b.BatchId,b.BatchId-1,N'BaseMerge',N'Batch '+CAST(b.BatchId AS NVARCHAR)+N' requires BaseMerge from batch '+CAST(b.BatchId-1 AS NVARCHAR)+N'.' FROM (SELECT DISTINCT BatchId FROM dbo.MigrationBatchPlan WHERE BatchId>1) b;
+INSERT INTO dbo.BatchDependencyPlan(BatchId,DependsOnBatch,DependencyType,Reason) VALUES(1,1,N'HO',N'Within batch 1, HO must complete before any region.');
+INSERT INTO dbo.BatchDependencyPlan(BatchId,DependsOnBatch,DependencyType,Reason) SELECT b.BatchId,b.BatchId-1,N'Validation',N'Batch '+CAST(b.BatchId AS NVARCHAR)+N' starts after batch '+CAST(b.BatchId-1 AS NVARCHAR)+N' validation.' FROM (SELECT DISTINCT BatchId FROM dbo.MigrationBatchPlan WHERE BatchId>1) b;
+GO
+-- Translation Type Config
+PRINT N'[CONFIG] Translation Type Configuration...';
+IF OBJECT_ID('dbo.TranslationPlan','U') IS NOT NULL DROP TABLE dbo.TranslationPlan;
+IF OBJECT_ID('dbo.TranslationTypeConfig','U') IS NOT NULL DROP TABLE dbo.TranslationTypeConfig;
+CREATE TABLE dbo.TranslationTypeConfig(TranslationType NVARCHAR(32) PRIMARY KEY,Category NVARCHAR(32) NOT NULL,SortOrder INT NOT NULL DEFAULT 0,Description NVARCHAR(256) NOT NULL,IsActive BIT NOT NULL DEFAULT 1,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+INSERT INTO dbo.TranslationTypeConfig(TranslationType,Category,SortOrder,Description) VALUES
+(N'Rekey',N'Identity',10,N'Multiplier-based PK rekey.'),
+(N'IdentityMap',N'Identity',20,N'Map branch identity to master.'),
+(N'FKRewrite',N'FK',30,N'Rewrite FK to rekeyed parent.'),
+(N'TranslateFK',N'FK',40,N'Translate FK to MergeToMaster parent.'),
+(N'ExpandPK',N'PK',50,N'Inject BranchId into composite PK.'),
+(N'ExpandFK',N'PK',60,N'Expand FK to include BranchId.'),
+(N'TranslateLookup',N'Special',70,N'Deduplicate lookup by natural key.');
+GO
+-- M4.2: Translation Requirement Planner
+PRINT N'[M4.2] Translation Requirement Planner...';
+CREATE TABLE dbo.TranslationPlan(TranslationPlanId INT IDENTITY PRIMARY KEY,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ColumnName NVARCHAR(256) NOT NULL,TranslationType NVARCHAR(32) NOT NULL,LookupSource NVARCHAR(512) NULL,LookupKey NVARCHAR(256) NULL,Notes NVARCHAR(512) NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT UQ_TP UNIQUE(SchemaName,TableName,ColumnName,TranslationType),CONSTRAINT FK_TP_Config FOREIGN KEY(TranslationType) REFERENCES dbo.TranslationTypeConfig(TranslationType));
+DECLARE @TplDB2 SYSNAME=dbo.GetTemplateDB();
+IF OBJECT_ID('tempdb..#TP') IS NOT NULL DROP TABLE #TP;
+CREATE TABLE #TP(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ColumnName NVARCHAR(256) NOT NULL,TranslationType NVARCHAR(32) NOT NULL,LookupSource NVARCHAR(512) NULL,LookupKey NVARCHAR(256) NULL,Notes NVARCHAR(512) NULL);
+-- Group 1: Identity
+INSERT INTO #TP(SchemaName,TableName,ColumnName,TranslationType,LookupSource,LookupKey,Notes)
+SELECT c.SchemaName,c.TableName,pk.ColumnName,N'Rekey',N'IDTranslationMap',pk.ColumnName,N'Rekey via multiplier.'
+FROM dbo.MigrationExecutionContract c JOIN dbo.TablePKColumns pk ON pk.DatabaseName=@TplDB2 AND pk.SchemaName=c.SchemaName AND pk.TableName=c.TableName AND pk.Ordinal=1
+WHERE c.MigrationMethod=N'REKEY' AND c.IsUnsupported=0 AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED') AND pk.ColumnName NOT IN(N'BranchId',N'BranchID');
+INSERT INTO #TP(SchemaName,TableName,ColumnName,TranslationType,LookupSource,LookupKey,Notes)
+SELECT c.SchemaName,c.TableName,ISNULL(ip.IdentityOwnerColumn,ip.MasterKeyColumn),N'IdentityMap',N'HO.'+c.TableName+N'.'+ISNULL(ip.MasterKeyColumn,N'?'),ISNULL(ip.MasterKeyColumn,N'?'),N'MergeToMaster entity='+ISNULL(ip.IdentityEntity,N'?')
+FROM dbo.MigrationExecutionContract c JOIN dbo.IdentityPlan ip ON ip.SchemaName=c.SchemaName AND ip.TableName=c.TableName
+WHERE c.MigrationMethod=N'MERGE_TO_MASTER' AND c.IsUnsupported=0 AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED') AND ISNULL(ip.IdentityOwnerColumn,ip.MasterKeyColumn) IS NOT NULL;
+-- Group 2: FK
+INSERT INTO #TP(SchemaName,TableName,ColumnName,TranslationType,LookupSource,LookupKey,Notes)
+SELECT DISTINCT fk.SchemaName,fk.TableName,fk.FKColumns,N'FKRewrite',N'IDTranslationMap via '+fk.ReferencedTable,fk.ReferencedColumns,N'FK→rekeyed parent '+fk.ReferencedTable
+FROM dbo.TableFKDetails fk JOIN dbo.MigrationExecutionContract cp ON cp.SchemaName=fk.ReferencedSchema AND cp.TableName=fk.ReferencedTable
+WHERE fk.DatabaseName=@TplDB2 AND fk.IsSelfReference=0 AND cp.MigrationMethod=N'REKEY' AND cp.IsUnsupported=0;
+INSERT INTO #TP(SchemaName,TableName,ColumnName,TranslationType,LookupSource,LookupKey,Notes)
+SELECT DISTINCT fk.SchemaName,fk.TableName,fk.FKColumns,N'TranslateFK',N'IdentityMap via '+fk.ReferencedTable,fk.ReferencedColumns,N'FK→MergeToMaster parent '+fk.ReferencedTable
+FROM dbo.TableFKDetails fk JOIN dbo.MigrationExecutionContract cp ON cp.SchemaName=fk.ReferencedSchema AND cp.TableName=fk.ReferencedTable
+WHERE fk.DatabaseName=@TplDB2 AND fk.IsSelfReference=0 AND cp.MigrationMethod=N'MERGE_TO_MASTER' AND cp.IsUnsupported=0;
+-- Group 3: PK Expansion
+INSERT INTO #TP(SchemaName,TableName,ColumnName,TranslationType,LookupSource,LookupKey,Notes)
+SELECT c.SchemaName,c.TableName,N'(CompositePK+BranchId)',N'ExpandPK',N'SourceDB.BranchId',N'BranchId',N'Inject BranchId into composite PK.'
+FROM dbo.MigrationExecutionContract c WHERE c.MigrationMethod=N'EXPAND_PK' AND c.IsUnsupported=0 AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED');
+INSERT INTO #TP(SchemaName,TableName,ColumnName,TranslationType,LookupSource,LookupKey,Notes)
+SELECT DISTINCT fk.SchemaName,fk.TableName,fk.FKColumns,N'ExpandFK',N'SourceDB.BranchId',N'BranchId',N'FK→expanded parent '+fk.ReferencedTable
+FROM dbo.TableFKDetails fk JOIN dbo.MigrationExecutionContract cp ON cp.SchemaName=fk.ReferencedSchema AND cp.TableName=fk.ReferencedTable
+WHERE fk.DatabaseName=@TplDB2 AND fk.IsSelfReference=0 AND cp.MigrationMethod=N'EXPAND_PK' AND cp.IsUnsupported=0;
+-- Group 4: Special
+INSERT INTO #TP(SchemaName,TableName,ColumnName,TranslationType,LookupSource,LookupKey,Notes)
+SELECT c.SchemaName,c.TableName,N'(NaturalKey)',N'TranslateLookup',N'NaturalKeyMerge',N'NaturalKey',N'Deduplicate by natural key.'
+FROM dbo.MigrationExecutionContract c WHERE c.MigrationMethod=N'MERGE_LOOKUP' AND c.IsUnsupported=0 AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED');
+-- Final insert
+INSERT INTO dbo.TranslationPlan(SchemaName,TableName,ColumnName,TranslationType,LookupSource,LookupKey,Notes)
+SELECT SchemaName,TableName,ColumnName,TranslationType,MAX(LookupSource),MAX(LookupKey),MAX(Notes) FROM #TP GROUP BY SchemaName,TableName,ColumnName,TranslationType;
+DROP TABLE #TP;
+DECLARE @msg NVARCHAR(MAX)=N'[M4.2] TranslationPlan: '+CAST((SELECT COUNT(*) FROM dbo.TranslationPlan) AS NVARCHAR)+N' entries.'; PRINT @msg;
+GO
+-- M4.3: Child Action Planner
+PRINT N'[M4.3] Child Action Planner...';
+DECLARE @TplDB3 SYSNAME=dbo.GetTemplateDB();
+UPDATE dbo.MigrationExecutionContract SET RequiredChildAction=CASE MigrationMethod WHEN N'REKEY' THEN N'RewriteFK' WHEN N'MERGE_TO_MASTER' THEN N'TranslateFK' WHEN N'MERGE_LOOKUP' THEN N'TranslateLookup' WHEN N'EXPAND_PK' THEN N'AddBranchId' ELSE N'None' END WHERE IsUnsupported=0 AND GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED');
+UPDATE mec SET RequiredChildAction=N'None' FROM dbo.MigrationExecutionContract mec WHERE RequiredChildAction<>N'None' AND RequiredChildAction IS NOT NULL AND NOT EXISTS(SELECT 1 FROM dbo.TableFKDetails fk WHERE fk.DatabaseName=@TplDB3 AND fk.ReferencedSchema=mec.SchemaName AND fk.ReferencedTable=mec.TableName AND fk.IsSelfReference=0);
+SELECT RequiredChildAction,COUNT(*)AS Tbls FROM dbo.MigrationExecutionContract WHERE IsUnsupported=0 GROUP BY RequiredChildAction ORDER BY COUNT(*)DESC;
+GO
+-- M4.8: Retry Policy
+PRINT N'[M4.8] Retry Policy...';
+IF OBJECT_ID('dbo.RetryPolicyConfig','U') IS NOT NULL DROP TABLE dbo.RetryPolicyConfig;
+CREATE TABLE dbo.RetryPolicyConfig(PolicyName NVARCHAR(32) PRIMARY KEY,MaxRetries INT NOT NULL DEFAULT 0,OnFailure NVARCHAR(32) NOT NULL,Description NVARCHAR(256) NULL);
+INSERT INTO dbo.RetryPolicyConfig(PolicyName,MaxRetries,OnFailure,Description) VALUES(N'Retry',3,N'Retry',N'Retry up to 3 times.'),(N'Skip',0,N'Skip',N'Skip failed table.'),(N'Manual',0,N'Manual',N'Pause for manual intervention.'),(N'Abort',0,N'Abort',N'Abort batch on failure.');
+UPDATE dbo.MigrationExecutionContract SET RetryPolicy=N'Retry' WHERE IsUnsupported=0;
+UPDATE dbo.MigrationExecutionContract SET RetryPolicy=N'Skip' WHERE MigrationMethod IN(N'PRESERVE',N'INSERT_ONLY') AND IsUnsupported=0;
+IF OBJECT_ID('dbo.SchemaDrift','U') IS NOT NULL
+UPDATE mec SET RetryPolicy=N'Manual' FROM dbo.MigrationExecutionContract mec WHERE mec.IsUnsupported=0 AND EXISTS(SELECT 1 FROM dbo.SchemaDrift sd WHERE sd.SchemaName=mec.SchemaName AND sd.TableName=mec.TableName AND sd.Severity=N'ERROR' AND sd.ResolutionStrategy IN(N'Blocking',N'Manual'));
+UPDATE dbo.MigrationExecutionContract SET RetryPolicy=N'Abort' WHERE IsUnsupported=1;
+SELECT RetryPolicy,COUNT(*)AS Tbls FROM dbo.MigrationExecutionContract WHERE IsUnsupported=0 GROUP BY RetryPolicy ORDER BY COUNT(*)DESC;
+GO
+-- M4.4: Runtime Object Planner
+PRINT N'[M4.4] Runtime Object Planner...';
+IF OBJECT_ID('dbo.RuntimeObjectPlan','U') IS NOT NULL DROP TABLE dbo.RuntimeObjectPlan;
+CREATE TABLE dbo.RuntimeObjectPlan(RuntimePlanId INT IDENTITY PRIMARY KEY,ObjectName NVARCHAR(128) NOT NULL,Purpose NVARCHAR(512) NOT NULL,CreateOrder INT NOT NULL,IsMandatory BIT NOT NULL DEFAULT 0,DependsOnType NVARCHAR(64) NULL,Status NVARCHAR(32) NOT NULL DEFAULT N'PENDING',CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT UQ_ROP UNIQUE(ObjectName));
+INSERT INTO dbo.RuntimeObjectPlan(ObjectName,Purpose,CreateOrder,IsMandatory,DependsOnType) VALUES
+(N'BatchExecutionLog',N'Tracks per-batch start/end.',10,1,N'Always'),
+(N'MigrationErrorLog',N'Captures per-table errors.',20,1,N'Always'),
+(N'IDTranslationMap',N'Maps old PK→new PK.',30,1,N'Always'),
+(N'ValidationResults',N'Stores validation outcomes.',40,1,N'Always');
+IF EXISTS(SELECT 1 FROM dbo.TranslationPlan WHERE TranslationType=N'IdentityMap')
+INSERT INTO dbo.RuntimeObjectPlan(ObjectName,Purpose,CreateOrder,IsMandatory,DependsOnType) VALUES(N'MergeKeyCache',N'Caches master-key lookups.',50,0,N'IdentityMap');
+IF EXISTS(SELECT 1 FROM dbo.TranslationPlan WHERE TranslationType IN(N'ExpandPK',N'ExpandFK'))
+INSERT INTO dbo.RuntimeObjectPlan(ObjectName,Purpose,CreateOrder,IsMandatory,DependsOnType) VALUES(N'BranchIdLookup',N'Maps source DB→BranchId.',60,0,N'ExpandPK|ExpandFK');
+SELECT ObjectName,Purpose,CreateOrder,IsMandatory FROM dbo.RuntimeObjectPlan ORDER BY CreateOrder;
+GO
+-- M4.5: vwExecutionSummary
+PRINT N'[M4.5] vwExecutionSummary...';
+IF OBJECT_ID('dbo.vwExecutionSummary','V') IS NOT NULL DROP VIEW dbo.vwExecutionSummary;
+GO
+EXEC(N'
+CREATE VIEW dbo.vwExecutionSummary
+AS
+SELECT c.SchemaName,c.TableName,c.MigrationMethod,c.UniquenessStrategy,c.SourcePolicy,c.ExecutionPhaseId,c.ExecutionOrder,c.RequiredChildAction,c.RetryPolicy,c.GovernanceStatus,c.IsUnsupported,
+ISNULL(ip.IdentityOwner,N''Unknown'') AS IdentityOwner,ISNULL(ip.IdentityEntity,N''Unknown'') AS IdentityEntity,ISNULL(ip.IdentityResolution,N''Unknown'') AS IdentityResolution,ip.MasterKeyColumn,
+ISNULL(STUFF((SELECT N'', ''+tp.TranslationType FROM dbo.TranslationPlan tp WHERE tp.SchemaName=c.SchemaName AND tp.TableName=c.TableName ORDER BY tp.TranslationType FOR XML PATH(N''''),TYPE).value(N''.'',N''nvarchar(max)''),1,2,N''''),N''None'') AS TranslationTypes,
+(SELECT COUNT(*) FROM dbo.TranslationPlan tp WHERE tp.SchemaName=c.SchemaName AND tp.TableName=c.TableName) AS TranslationCount,
+(SELECT COUNT(*) FROM dbo.MigrationSourcePlan msp WHERE msp.ContractId=c.ContractId) AS SourceDBCount,
+(SELECT COUNT(DISTINCT fk.TableName) FROM dbo.TableFKDetails fk WHERE fk.DatabaseName=dbo.GetTemplateDB() AND fk.ReferencedSchema=c.SchemaName AND fk.ReferencedTable=c.TableName AND fk.IsSelfReference=0) AS DependentChildCount,
+CASE WHEN EXISTS(SELECT 1 FROM dbo.SchemaDrift sd WHERE sd.SchemaName=c.SchemaName AND sd.TableName=c.TableName AND sd.Severity=N''ERROR'') THEN 1 ELSE 0 END AS HasDriftErrors
+FROM dbo.MigrationExecutionContract c LEFT JOIN dbo.IdentityPlan ip ON ip.SchemaName=c.SchemaName AND ip.TableName=c.TableName;
+');
+GO
+-- M4.9: Execution Manifest
+PRINT N'[M4.9] Execution Manifest...';
+IF OBJECT_ID('dbo.ExecutionManifest','U') IS NOT NULL DROP TABLE dbo.ExecutionManifest;
+CREATE TABLE dbo.ExecutionManifest(
+ManifestId INT IDENTITY PRIMARY KEY, ContractId UNIQUEIDENTIFIER NOT NULL, SchemaName SYSNAME NOT NULL, TableName SYSNAME NOT NULL,
+MigrationMethod NVARCHAR(32) NOT NULL, UniquenessStrategy NVARCHAR(32) NULL, SourcePolicy NVARCHAR(32) NULL,
+IdentityOwner NVARCHAR(32) NOT NULL DEFAULT N'Unknown', IdentityEntity NVARCHAR(64) NULL, IdentityResolution NVARCHAR(32) NULL,
+MasterKeyColumn NVARCHAR(256) NULL, ExecutionPhaseId INT NULL, ExecutionOrder INT NULL,
+RequiredChildAction NVARCHAR(32) NULL, RetryPolicy NVARCHAR(32) NULL, SourceDBCount INT NOT NULL DEFAULT 0,
+TranslationTypes NVARCHAR(512) NULL, TranslationCount INT NOT NULL DEFAULT 0, ValidationCount INT NOT NULL DEFAULT 0,
+FKRewriteCount INT NOT NULL DEFAULT 0, HasMergeKeyPlan BIT NOT NULL DEFAULT 0, DependentChildCount INT NOT NULL DEFAULT 0,
+HasDriftErrors BIT NOT NULL DEFAULT 0, MergePredicate NVARCHAR(MAX) NULL, HasIdentity BIT NOT NULL DEFAULT 0,
+NeedsSourceOrd BIT NOT NULL DEFAULT 0, IsRekey BIT NOT NULL DEFAULT 0, RekeyTargetType NVARCHAR(128) NULL,
+Status NVARCHAR(32) NOT NULL DEFAULT N'Active', CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+CONSTRAINT UQ_EM UNIQUE(SchemaName,TableName));
+DECLARE @TplDB9 SYSNAME=dbo.GetTemplateDB();
+INSERT INTO dbo.ExecutionManifest(ContractId,SchemaName,TableName,MigrationMethod,UniquenessStrategy,SourcePolicy,IdentityOwner,IdentityEntity,IdentityResolution,MasterKeyColumn,ExecutionPhaseId,ExecutionOrder,RequiredChildAction,RetryPolicy,SourceDBCount,TranslationTypes,TranslationCount,DependentChildCount,HasDriftErrors,Status)
+SELECT c.ContractId,c.SchemaName,c.TableName,c.MigrationMethod,c.UniquenessStrategy,c.SourcePolicy,
+ISNULL(ip.IdentityOwner,N'Unknown'),ISNULL(ip.IdentityEntity,N'Unknown'),ISNULL(ip.IdentityResolution,N'Unknown'),ip.MasterKeyColumn,
+c.ExecutionPhaseId,c.ExecutionOrder,c.RequiredChildAction,c.RetryPolicy,
+(SELECT COUNT(*) FROM dbo.MigrationSourcePlan msp WHERE msp.ContractId=c.ContractId),
+ISNULL(STUFF((SELECT N', '+tp.TranslationType FROM dbo.TranslationPlan tp WHERE tp.SchemaName=c.SchemaName AND tp.TableName=c.TableName ORDER BY tp.TranslationType FOR XML PATH(N''),TYPE).value(N'.',N'nvarchar(max)'),1,2,N''),N'None'),
+(SELECT COUNT(*) FROM dbo.TranslationPlan tp WHERE tp.SchemaName=c.SchemaName AND tp.TableName=c.TableName),
+(SELECT COUNT(DISTINCT fk.TableName) FROM dbo.TableFKDetails fk WHERE fk.DatabaseName=@TplDB9 AND fk.ReferencedSchema=c.SchemaName AND fk.ReferencedTable=c.TableName AND fk.IsSelfReference=0),
+CASE WHEN EXISTS(SELECT 1 FROM dbo.SchemaDrift sd WHERE sd.SchemaName=c.SchemaName AND sd.TableName=c.TableName AND sd.Severity=N'ERROR') THEN 1 ELSE 0 END,
+CASE WHEN c.IsUnsupported=1 THEN N'Unsupported' WHEN c.GovernanceStatus IN(N'PENDING_REVIEW',N'REJECTED') THEN c.GovernanceStatus ELSE N'Active' END
+FROM dbo.MigrationExecutionContract c LEFT JOIN dbo.IdentityPlan ip ON ip.SchemaName=c.SchemaName AND ip.TableName=c.TableName;
+UPDATE em SET ValidationCount=(SELECT COUNT(*) FROM dbo.ValidationPlan vp WHERE vp.SchemaName=em.SchemaName AND vp.TableName=em.TableName) FROM dbo.ExecutionManifest em;
+UPDATE em SET FKRewriteCount=(SELECT COUNT(*) FROM dbo.FKRewritePlan frp WHERE frp.ParentSchema=em.SchemaName AND frp.ParentTable=em.TableName) FROM dbo.ExecutionManifest em;
+UPDATE em SET HasMergeKeyPlan=1 FROM dbo.ExecutionManifest em WHERE EXISTS(SELECT 1 FROM dbo.MergeKeyPlan mkp WHERE mkp.SchemaName=em.SchemaName AND mkp.TableName=em.TableName);
+UPDATE em SET HasIdentity=ISNULL(td.HasIdentity,0) FROM dbo.ExecutionManifest em LEFT JOIN dbo.TableDetails td ON td.DatabaseName=@TplDB9 AND td.SchemaName=em.SchemaName AND td.TableName=em.TableName;
+UPDATE em SET NeedsSourceOrd=CASE WHEN em.TranslationCount>0 THEN 1 ELSE 0 END FROM dbo.ExecutionManifest em;
+UPDATE em SET IsRekey=1,RekeyTargetType=rp.NewDataType FROM dbo.ExecutionManifest em JOIN dbo.RekeyPlan rp ON rp.SchemaName=em.SchemaName AND rp.TableName=em.TableName AND rp.IsUnsupported=0;
+UPDATE em SET MergePredicate=mp.Pred FROM dbo.ExecutionManifest em CROSS APPLY(SELECT STUFF((SELECT N' AND tgt.'+QUOTENAME(ISNULL(mkp.TargetColumnName,mkp.ColumnName))+N' '+mkp.ComparisonOperator+N' src.'+QUOTENAME(mkp.ColumnName) FROM dbo.MergeKeyPlan mkp WHERE mkp.SchemaName=em.SchemaName AND mkp.TableName=em.TableName ORDER BY mkp.Ordinal FOR XML PATH(N''),TYPE).value(N'.',N'nvarchar(max)'),1,5,N'') AS Pred) mp WHERE mp.Pred IS NOT NULL AND mp.Pred<>N'';
+DECLARE @msg NVARCHAR(MAX)=N'[M4.9] Manifest: '+CAST((SELECT COUNT(*) FROM dbo.ExecutionManifest WHERE Status=N'Active') AS NVARCHAR)+N' active.'; PRINT @msg;
+SELECT MigrationMethod,COUNT(*)AS Tbls FROM dbo.ExecutionManifest WHERE Status=N'Active' GROUP BY MigrationMethod ORDER BY COUNT(*)DESC;
+GO
+-- M4.6: Final Readiness Check
+PRINT N'[M4.6] Final Readiness Check...';
+IF OBJECT_ID('dbo.MigrationReadiness','U') IS NOT NULL DROP TABLE dbo.MigrationReadiness;
+CREATE TABLE dbo.MigrationReadiness(RunId UNIQUEIDENTIFIER PRIMARY KEY,Status NVARCHAR(16) NOT NULL,ErrorCount INT NOT NULL,WarningCount INT NOT NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+IF OBJECT_ID('dbo.MigrationReadinessDetail','U') IS NOT NULL DROP TABLE dbo.MigrationReadinessDetail;
+CREATE TABLE dbo.MigrationReadinessDetail(DetailId INT IDENTITY PRIMARY KEY,RunId UNIQUEIDENTIFIER NOT NULL,CheckName NVARCHAR(64) NOT NULL,Severity NVARCHAR(16) NOT NULL,SchemaName SYSNAME NULL,TableName SYSNAME NULL,Message NVARCHAR(MAX) NOT NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+DECLARE @RunId UNIQUEIDENTIFIER=NEWID();
+DECLARE @TplDB6 SYSNAME=dbo.GetTemplateDB();
+DECLARE @HODB6 SYSNAME=(SELECT TOP 1 DBName FROM dbo.DiscoveryConfig WHERE IsActive=1 AND DatabaseRole=N'HO');
+-- Check 1: Source completeness
+-- FIX: TEMPLATE_ONLY tables (no rows in HO or any region) legitimately have zero MigrationSourcePlan rows --
+-- that's correct behavior, not a defect. Only flag ERROR for policies that are supposed to have a source.
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'SourceCompleteness',N'ERROR',c.SchemaName,c.TableName,N'Supported table has no MigrationSourcePlan.'
+FROM dbo.MigrationExecutionContract c WHERE c.IsUnsupported=0 AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED') AND c.SourcePolicy<>N'TEMPLATE_ONLY' AND NOT EXISTS(SELECT 1 FROM dbo.MigrationSourcePlan msp WHERE msp.ContractId=c.ContractId);
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'SourceCompleteness',N'INFO',c.SchemaName,c.TableName,N'TEMPLATE_ONLY: no data source in HO or region, schema-only table.'
+FROM dbo.MigrationExecutionContract c WHERE c.IsUnsupported=0 AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED') AND c.SourcePolicy=N'TEMPLATE_ONLY' AND NOT EXISTS(SELECT 1 FROM dbo.MigrationSourcePlan msp WHERE msp.ContractId=c.ContractId);
+-- Check 2: Execution order
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'ExecutionOrder',N'ERROR',fk.SchemaName,fk.TableName,N'Child ExecOrder('+CAST(c1.ExecutionOrder AS NVARCHAR)+N') <= parent '+fk.ReferencedTable+N'('+CAST(c2.ExecutionOrder AS NVARCHAR)+N').'
+FROM dbo.TableFKDetails fk JOIN dbo.MigrationExecutionContract c1 ON c1.SchemaName=fk.SchemaName AND c1.TableName=fk.TableName JOIN dbo.MigrationExecutionContract c2 ON c2.SchemaName=fk.ReferencedSchema AND c2.TableName=fk.ReferencedTable
+WHERE fk.DatabaseName=@TplDB6 AND fk.IsSelfReference=0 AND c1.IsUnsupported=0 AND c2.IsUnsupported=0 AND c1.ExecutionOrder<=c2.ExecutionOrder;
+-- Check 3: FK rewrite completeness
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'FKRewriteCompleteness',N'ERROR',c.SchemaName,c.TableName,N'Method='+c.MigrationMethod+N' with children but no FKRewritePlan.'
+FROM dbo.MigrationExecutionContract c WHERE c.MigrationMethod IN(N'EXPAND_PK',N'MERGE_TO_MASTER') AND c.IsUnsupported=0 AND EXISTS(SELECT 1 FROM dbo.TableFKDetails fk WHERE fk.DatabaseName=@TplDB6 AND fk.ReferencedSchema=c.SchemaName AND fk.ReferencedTable=c.TableName AND fk.IsSelfReference=0) AND NOT EXISTS(SELECT 1 FROM dbo.FKRewritePlan frp WHERE frp.ParentSchema=c.SchemaName AND frp.ParentTable=c.TableName);
+-- Check 4: Merge key completeness
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'MergeKeyCompleteness',N'ERROR',c.SchemaName,c.TableName,N'MERGE_TO_MASTER but MasterKeyColumn is NULL.'
+FROM dbo.MigrationExecutionContract c JOIN dbo.IdentityPlan ip ON ip.SchemaName=c.SchemaName AND ip.TableName=c.TableName WHERE c.MigrationMethod=N'MERGE_TO_MASTER' AND c.IsUnsupported=0 AND ip.MasterKeyColumn IS NULL;
+-- Check 5: Batch completeness
+IF NOT EXISTS(SELECT 1 FROM dbo.MigrationBatchPlan WHERE SourceDB=@HODB6)
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,Message) VALUES(@RunId,N'BatchCompleteness',N'ERROR',N'HO database not in any batch.');
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,Message)
+SELECT @RunId,N'BatchCompleteness',N'ERROR',N'Region '+dc.DBName+N' not in any batch.'
+FROM dbo.DiscoveryConfig dc WHERE dc.IsActive=1 AND dc.DatabaseRole=N'Region' AND NOT EXISTS(SELECT 1 FROM dbo.MigrationBatchPlan mbp WHERE mbp.SourceDB=dc.DBName);
+-- Check 6: Policy contradiction
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'PolicyContradiction',N'ERROR',c.SchemaName,c.TableName,N'SourcePolicy=HO_ONLY + MigrationMethod=REKEY is contradictory.'
+FROM dbo.MigrationExecutionContract c WHERE c.SourcePolicy=N'HO_ONLY' AND c.MigrationMethod=N'REKEY' AND c.IsUnsupported=0;
+-- Check 7: Validation completeness
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'ValidationCompleteness',N'WARNING',c.SchemaName,c.TableName,N'No ValidationPlan for supported table.'
+FROM dbo.MigrationExecutionContract c WHERE c.IsUnsupported=0 AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED') AND NOT EXISTS(SELECT 1 FROM dbo.ValidationPlan vp WHERE vp.SchemaName=c.SchemaName AND vp.TableName=c.TableName);
+-- Check 8: Translation completeness
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'TranslationCompleteness',N'WARNING',c.SchemaName,c.TableName,N'Method='+c.MigrationMethod+N' but no TranslationPlan.'
+FROM dbo.MigrationExecutionContract c WHERE c.IsUnsupported=0 AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED') AND c.MigrationMethod NOT IN(N'PRESERVE',N'INSERT_ONLY',N'OVERWRITE') AND NOT EXISTS(SELECT 1 FROM dbo.TranslationPlan tp WHERE tp.SchemaName=c.SchemaName AND tp.TableName=c.TableName);
+DECLARE @ErrCnt INT=(SELECT COUNT(*) FROM dbo.MigrationReadinessDetail WHERE RunId=@RunId AND Severity=N'ERROR');
+DECLARE @WrnCnt INT=(SELECT COUNT(*) FROM dbo.MigrationReadinessDetail WHERE RunId=@RunId AND Severity=N'WARNING');
+DECLARE @RdyStatus NVARCHAR(16)=CASE WHEN @ErrCnt>0 THEN N'BLOCKED' ELSE N'READY' END;
+INSERT INTO dbo.MigrationReadiness(RunId,Status,ErrorCount,WarningCount) VALUES(@RunId,@RdyStatus,@ErrCnt,@WrnCnt);
+PRINT N'';
+PRINT N'╔══════════════════════════════════════════════════════════════════╗';
+IF @RdyStatus=N'READY' PRINT N'║  MIGRATION READINESS:  READY                                     ║';
+ELSE PRINT N'║  MIGRATION READINESS:  BLOCKED                                   ║';
+PRINT N'╚══════════════════════════════════════════════════════════════════╝';
+PRINT N'  Errors: '+CAST(@ErrCnt AS NVARCHAR)+N'    Warnings: '+CAST(@WrnCnt AS NVARCHAR);
+SELECT CheckName,Severity,COUNT(*)AS Issues FROM dbo.MigrationReadinessDetail WHERE RunId=@RunId GROUP BY CheckName,Severity ORDER BY CASE Severity WHEN N'ERROR' THEN 1 WHEN N'WARNING' THEN 2 ELSE 3 END,CheckName;
+SELECT @RunId as RunId,@RdyStatus as [Status],@ErrCnt as ErrorCount,@WrnCnt as Warning;
+GO
+-- ═══════════════════════════════════════════════════════════════════
+-- FINAL GATEKEEPER (FIX: Moved to after MILESTONE IV)
+-- ═══════════════════════════════════════════════════════════════════
+PRINT N'[GATEKEEPER] Running final validation...';
+DECLARE @VId UNIQUEIDENTIFIER,@Passed BIT,@ErrCnt INT;
+EXEC dbo.usp_GateKeeperPass @VId=@VId OUTPUT,@Passed=@Passed OUTPUT,@ErrCnt=@ErrCnt OUTPUT,@ShowSel=1;
+IF @Passed=1 PRINT N'═══ LAYER 2 COMPLETE — ALL CHECKS PASSED ═══';
+ELSE PRINT N'═══ LAYER 2 COMPLETE — '+CAST(@ErrCnt AS NVARCHAR)+N' ERROR(S) ═══';
+DECLARE @msg NVARCHAR(MAX)=N'[LAYER 2] Finished: '+CONVERT(NVARCHAR(30),GETDATE(),121); PRINT @msg;
+GO
