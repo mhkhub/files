@@ -420,10 +420,8 @@ INSERT INTO dbo.BusinessOwnerVocabulary VALUES
 IF OBJECT_ID('dbo.BusinessOwnerOverride','U') IS NULL
 CREATE TABLE dbo.BusinessOwnerOverride(OverrideId INT IDENTITY PRIMARY KEY,DatabaseName SYSNAME NULL,DatabaseRole NVARCHAR(16) NULL,SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,ColumnPattern NVARCHAR(128) NOT NULL,OwnerType NVARCHAR(16) NOT NULL,MatchType NVARCHAR(16) NOT NULL DEFAULT N'EXACT',Priority INT NOT NULL DEFAULT 50,Reason NVARCHAR(512) NULL,CreatedBy NVARCHAR(128) NOT NULL DEFAULT N'System',CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),CONSTRAINT UQ_BOO UNIQUE(DatabaseName,SchemaName,TableName,ColumnPattern,OwnerType));
 
-IF OBJECT_ID('dbo.EvidenceWeightConfig','U') IS NOT NULL DROP TABLE dbo.EvidenceWeightConfig;
-CREATE TABLE dbo.EvidenceWeightConfig(ConfigId INT IDENTITY PRIMARY KEY,WeightVersion NVARCHAR(16) NOT NULL DEFAULT N'V1.0',CustomerName NVARCHAR(128) NULL,SignalName NVARCHAR(64) NOT NULL,Category NVARCHAR(32) NOT NULL,MatchType CHAR(6) NOT NULL,MatchValue NVARCHAR(64) NULL,MinValue FLOAT NULL,MaxValue FLOAT NULL,Weight INT NOT NULL,Reason NVARCHAR(128) NULL,IsActive BIT NOT NULL DEFAULT 1,EffectiveFrom DATETIME2 NULL,EffectiveTo DATETIME2 NULL,CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
-INSERT INTO dbo.EvidenceWeightConfig(SignalName,Category,MatchType,MatchValue,MinValue,MaxValue,Weight,Reason) VALUES
-(N'RowCountIdentical',N'Lookup','EQ',N'1',NULL,NULL,30,N'Same row count'),(N'NaturalKeyCount',N'Lookup','GT',NULL,0,NULL,25,N'Natural key'),(N'IncomingFK',N'Lookup','GT',NULL,10,NULL,20,N'Many refs'),(N'NoBranchId',N'Lookup','EQ',N'1',NULL,NULL,15,N'No branch'),(N'BranchId',N'Lookup','EQ',N'1',NULL,NULL,-15,N'Has BranchId'),(N'NameGen',N'Lookup','EQ',N'1',NULL,NULL,8,N'gen*'),(N'BranchId',N'Master','EQ',N'1',NULL,NULL,25,N'Has BranchId'),(N'IsHub',N'Master','EQ',N'1',NULL,NULL,20,N'High children'),(N'NameMaster',N'Master','EQ',N'1',NULL,NULL,8,N'Master pattern'),(N'BranchId',N'TransactionHeader','EQ',N'1',NULL,NULL,20,N'Has BranchId'),(N'HasDateRange',N'TransactionHeader','EQ',N'1',NULL,NULL,10,N'Has CreatedDate'),(N'OutgoingFK',N'TransactionDetail','EQ',N'1',NULL,NULL,30,N'Points to header'),(N'RowCountIdentical',N'Configuration','EQ',N'1',NULL,NULL,25,N'Same rows'),(N'NoBranchId',N'Configuration','EQ',N'1',NULL,NULL,20,N'No branch'),(N'HasNaturalKeyCandidate',N'Lookup','EQ',N'1',NULL,NULL,20,N'Natural key exists'),(N'SemScoreLookup',N'Lookup','GT',NULL,0,NULL,25,N'Lookup term'),(N'SemScoreMaster',N'Master','GT',NULL,0,NULL,25,N'Master term'),(N'SemScoreHeader',N'TransactionHeader','GT',NULL,0,NULL,25,N'Header term'),(N'SemScoreDetail',N'TransactionDetail','GT',NULL,0,NULL,25,N'Detail term'),(N'SemScoreConfig',N'Configuration','GT',NULL,0,NULL,25,N'Config term'),(N'NoBusinessDate',N'Lookup','EQ',N'1',NULL,NULL,10,N'No biz dates'),(N'HasApprovalWorkflow',N'Lookup','EQ',N'1',NULL,NULL,-20,N'Has approval'),(N'HasLifecycleDates',N'Lookup','EQ',N'1',NULL,NULL,-10,N'Has lifecycle'),(N'HasBusinessDate',N'TransactionHeader','EQ',N'1',NULL,NULL,20,N'Has biz date'),(N'HasApprovalWorkflow',N'TransactionHeader','EQ',N'1',NULL,NULL,15,N'Has approval'),(N'HasLifecycleDates',N'Master','EQ',N'1',NULL,NULL,10,N'Has lifecycle'),(N'HasMoneyColumns',N'TransactionDetail','EQ',N'1',NULL,NULL,25,N'Has money'),(N'HasMoneyColumns',N'TransactionHeader','EQ',N'1',NULL,NULL,15,N'Has money'),(N'HasMoneyColumns',N'Lookup','EQ',N'1',NULL,NULL,-25,N'Money disqualifies'),(N'HasDocumentColumns',N'Lookup','EQ',N'1',NULL,NULL,-15,N'Doc disqualifies'),(N'HasDocumentColumns',N'TransactionDetail','EQ',N'1',NULL,NULL,10,N'Has doc'),(N'IsNarrowTable',N'Lookup','EQ',N'1',NULL,NULL,10,N'Narrow'),(N'IsWideTable',N'Lookup','EQ',N'1',NULL,NULL,-15,N'Wide disqualifies'),(N'IsWideTable',N'Master','EQ',N'1',NULL,NULL,10,N'Wide ok'),(N'NumericHeavy',N'TransactionDetail','EQ',N'1',NULL,NULL,10,N'Numeric'),(N'HasMasterKey',N'Master','EQ',N'1',NULL,NULL,80,N'Master key'),(N'MasterPatternCount',N'Master','GT',NULL,0,NULL,60,N'Pattern match'),(N'MasterConfidence',N'Master','GT',NULL,80,NULL,50,N'High confidence'),(N'ReferenceOwnerCount',N'Master','GT',NULL,0,NULL,40,N'HO refs'),(N'HasHOOwnerPattern',N'Master','EQ',N'1',NULL,NULL,35,N'HO owner'),(N'HasMasterKey',N'Lookup','EQ',N'1',NULL,NULL,-30,N'Key disqualifies'),(N'HasMasterKey',N'TransactionHeader','EQ',N'1',NULL,NULL,-20,N'Key disqualifies'),(N'HasMasterKey',N'TransactionDetail','EQ',N'1',NULL,NULL,-30,N'Key disqualifies'),(N'NameDetail',N'TransactionDetail','EQ',N'1',NULL,NULL,40,N'Detail name'),(N'HasDetailChild',N'TransactionDetail','EQ',N'1',NULL,NULL,-20,N'Children disqualify'),(N'IsMergeToMasterEligible',N'_Strategy','EQ',N'1',NULL,NULL,200,N'MTM eligible'),(N'NameEntity',N'Master','EQ',N'1',NULL,NULL,30,N'Table contains recognized entity name'),(N'HasEntityID',N'Master','EQ',N'1',NULL,NULL,40,N'Has entity ID column'),(N'HasHOEntityID',N'Master','EQ',N'1',NULL,NULL,80,N'Has HO entity ID column'),(N'IdentityEntity',N'Master','EQ',N'1',NULL,NULL,50,N'IdentityPlan entity recognized');
+-- Legacy rule-engine EvidenceWeightConfig removed. The neutral ownership evidence engine creates
+-- the current EvidenceWeightConfig schema in PHASE 2.ID.EVIDENCE.
 GO
 
 
@@ -500,20 +498,157 @@ SELECT SchemaName, TableName, N'NameDetail', 'B',
 FROM dbo.TableDetails WHERE DatabaseName = @TemplateDB;
 PRINT N'[PHASE 2/9] Complete.';
 GO
+
+-- ═══ PHASE 2.ID: BUILD IDENTITY PLAN (MISSING - ADDED) ═══════════════════════════════════
+PRINT N'[PHASE 2.ID] Building IdentityPlan...';
+IF OBJECT_ID('dbo.IdentityPlan','U') IS NOT NULL DROP TABLE dbo.IdentityPlan;
+CREATE TABLE dbo.IdentityPlan(
+    SchemaName SYSNAME NOT NULL,
+    TableName SYSNAME NOT NULL,
+    IdentityOwner NVARCHAR(32) NOT NULL DEFAULT N'Unknown',
+    IdentityResolution NVARCHAR(32) NULL,
+    IdentityType NVARCHAR(32) NULL,
+    IdentityEntity NVARCHAR(64) NULL,
+    IdentityParent NVARCHAR(256) NULL,
+    IdentityOwnerColumn NVARCHAR(256) NULL,
+    IdentityAuthority NVARCHAR(32) NULL,
+    IdentityAnchor BIT NOT NULL DEFAULT 0,
+    RelationshipType NVARCHAR(32) NULL,
+    HOColumnCount INT NOT NULL DEFAULT 0,
+    RegionColumnCount INT NOT NULL DEFAULT 0,
+    HasMasterKey BIT NOT NULL DEFAULT 0,
+    MasterKeyColumn NVARCHAR(256) NULL,
+    ExistsInHO BIT NOT NULL DEFAULT 0,
+    ExistsInRegion BIT NOT NULL DEFAULT 0,
+    HasBranchIdInPK BIT NOT NULL DEFAULT 0,
+    IsCompositePK BIT NOT NULL DEFAULT 0,
+    HasIdentityColumn BIT NOT NULL DEFAULT 0,
+    TotalIncomingRefs INT NOT NULL DEFAULT 0,
+    V10Winner NVARCHAR(32) NULL,
+    ConfidenceScore DECIMAL(5,2) NULL,
+    ClassificationTier NVARCHAR(32) NULL,
+    EvidenceCount INT NULL,
+    EvidenceBreadth INT NULL,
+    NetScore INT NULL,
+    PositiveScore INT NULL,
+    NegativeScore INT NULL,
+    TopPositiveKey NVARCHAR(128) NULL,
+    TopNegativeKey NVARCHAR(128) NULL,
+    OwnershipRule NVARCHAR(64) NULL,
+    ReasonCode NVARCHAR(64) NULL,
+    ReasonText NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_IP PRIMARY KEY(SchemaName, TableName)
+);
+
+DECLARE @TemplateDB SYSNAME = dbo.GetTemplateDB();
+DECLARE @MasterSourceDB SYSNAME = dbo.GetMasterSourceDB();
+
+-- Populate IdentityPlan from discovered metadata
+INSERT INTO dbo.IdentityPlan(SchemaName, TableName, HOColumnCount, RegionColumnCount, ExistsInHO, ExistsInRegion, HasBranchIdInPK, IsCompositePK, HasIdentityColumn, TotalIncomingRefs)
+SELECT
+    td.SchemaName,
+    td.TableName,
+    -- HOColumnCount: Count explicit HO ownership columns
+    (SELECT COUNT(*) FROM dbo.TableColumns tc
+     WHERE tc.DatabaseName = @TemplateDB AND tc.SchemaName = td.SchemaName AND tc.TableName = td.TableName
+     AND (tc.ColumnName LIKE N'HO%' OR tc.ColumnName LIKE N'%HOID' OR tc.ColumnName LIKE N'%HO_ID')),
+    -- RegionColumnCount: Count explicit Region ownership columns
+    (SELECT COUNT(*) FROM dbo.TableColumns tc
+     WHERE tc.DatabaseName = @TemplateDB AND tc.SchemaName = td.SchemaName AND tc.TableName = td.TableName
+     AND (tc.ColumnName LIKE N'BranchId%' OR tc.ColumnName LIKE N'RegionId%')),
+    -- ExistsInHO
+    CASE WHEN EXISTS(SELECT 1 FROM dbo.TableDetails td2 WHERE td2.DatabaseName = @MasterSourceDB AND td2.SchemaName = td.SchemaName AND td2.TableName = td.TableName) THEN 1 ELSE 0 END,
+    -- ExistsInRegion
+    CASE WHEN EXISTS(SELECT 1 FROM dbo.TableDetails td3 JOIN dbo.DiscoveryConfig dc ON td3.DatabaseName = dc.DBName WHERE td3.DatabaseName NOT IN (@MasterSourceDB, @TemplateDB) AND dc.DatabaseRole = N'Region' AND td3.SchemaName = td.SchemaName AND td3.TableName = td.TableName) THEN 1 ELSE 0 END,
+    -- HasBranchIdInPK
+    CASE WHEN EXISTS(SELECT 1 FROM dbo.TablePKColumns pk WHERE pk.DatabaseName = @TemplateDB AND pk.SchemaName = td.SchemaName AND pk.TableName = td.TableName AND pk.ColumnName IN(N'BranchId',N'BranchID',N'RegionId',N'RegionID')) THEN 1 ELSE 0 END,
+    -- IsCompositePK
+    CASE WHEN (SELECT COUNT(*) FROM dbo.TablePKColumns pk WHERE pk.DatabaseName = @TemplateDB AND pk.SchemaName = td.SchemaName AND pk.TableName = td.TableName) > 1 THEN 1 ELSE 0 END,
+    -- HasIdentityColumn
+    CASE WHEN EXISTS(SELECT 1 FROM dbo.TableColumns tc WHERE tc.DatabaseName = @TemplateDB AND tc.SchemaName = td.SchemaName AND tc.TableName = td.TableName AND tc.IsIdentity = 1) THEN 1 ELSE 0 END,
+    -- TotalIncomingRefs
+    ISNULL((SELECT COUNT(*) FROM dbo.TableFKDetails fk WHERE fk.ReferencedSchema = td.SchemaName AND fk.ReferencedTable = td.TableName AND fk.DatabaseName = @TemplateDB), 0)
+FROM dbo.TableDetails td
+WHERE td.DatabaseName = @TemplateDB;
+
+-- Update HasMasterKey and MasterKeyColumn
+UPDATE ip SET
+    HasMasterKey = 1,
+    MasterKeyColumn = mc.MasterKeyColumn,
+    IdentityOwnerColumn = mc.MasterKeyColumn
+FROM dbo.IdentityPlan ip
+CROSS APPLY (
+    SELECT TOP 1 tc.ColumnName AS MasterKeyColumn
+    FROM dbo.TableColumns tc
+    WHERE tc.DatabaseName = @TemplateDB AND tc.SchemaName = ip.SchemaName AND tc.TableName = ip.TableName
+    AND (tc.ColumnName LIKE N'%MasterKey%' OR tc.ColumnName LIKE N'%BusinessKey%' OR tc.ColumnName LIKE N'%NaturalKey%')
+    ORDER BY tc.ColumnName
+) mc;
+
+UPDATE ip SET
+    IdentityParent = parent.ParentName
+FROM dbo.IdentityPlan ip
+CROSS APPLY (
+    SELECT TOP 1 fk.ReferencedSchema + N'.' + fk.ReferencedTable AS ParentName
+    FROM dbo.TableFKDetails fk
+    WHERE fk.DatabaseName=@TemplateDB
+      AND fk.SchemaName=ip.SchemaName
+      AND fk.TableName=ip.TableName
+      AND ISNULL(fk.IsSelfReference,0)=0
+    ORDER BY fk.ReferencedSchema,fk.ReferencedTable
+) parent;
+
+-- Initial IdentityOwner assignment based on explicit signals
+UPDATE dbo.IdentityPlan SET
+    IdentityOwner = CASE
+        WHEN HOColumnCount > 0 THEN N'HO'
+        WHEN RegionColumnCount > 0 THEN N'Region'
+        WHEN IsCompositePK = 1 AND HasBranchIdInPK = 1 THEN N'Composite'
+        WHEN HasIdentityColumn = 1 AND ExistsInHO = 0 AND ExistsInRegion = 1 THEN N'Generated'
+        WHEN ExistsInHO = 1 AND ExistsInRegion = 0 THEN N'HO'
+        WHEN ExistsInHO = 0 AND ExistsInRegion = 1 THEN N'Region'
+        ELSE N'Unknown'
+    END,
+    IdentityResolution = CASE
+        WHEN HOColumnCount > 0 THEN N'Preserve'
+        WHEN RegionColumnCount > 0 THEN N'Preserve'
+        WHEN IsCompositePK = 1 THEN N'Preserve'
+        WHEN HasIdentityColumn = 1 THEN N'Generate'
+        ELSE N'Unknown'
+    END,
+    OwnershipRule = N'PASS1_EXPLICIT_SIGNALS',
+    ReasonCode = CASE
+        WHEN HOColumnCount > 0 THEN N'HO_COLUMNS'
+        WHEN RegionColumnCount > 0 THEN N'REGION_COLUMNS'
+        WHEN IsCompositePK = 1 THEN N'COMPOSITE_PK'
+        WHEN HasIdentityColumn = 1 THEN N'IDENTITY_COLUMN'
+        WHEN ExistsInHO = 1 AND ExistsInRegion = 0 THEN N'HO_ONLY'
+        WHEN ExistsInHO = 0 AND ExistsInRegion = 1 THEN N'REGION_ONLY'
+        ELSE N'UNKNOWN'
+    END;
+
+DECLARE @ipCnt INT = @@ROWCOUNT;
+PRINT N'[PHASE 2.ID] Pass 1: ' + CAST(@ipCnt AS NVARCHAR) + N' tables.';
+SELECT IdentityOwner, COUNT(*) AS T FROM dbo.IdentityPlan GROUP BY IdentityOwner ORDER BY COUNT(*) DESC;
+GO
+
 -- ═══ PHASE 2.ID.EVIDENCE: COLLECT NEUTRAL OWNERSHIP EVIDENCE ═══════════════════════════════════
 PRINT N'[PHASE 2.ID.EVIDENCE] Collecting neutral ownership evidence...';
 
 -- Create configuration tables if not exist
 IF OBJECT_ID('dbo.EvidenceWeightConfig','U') IS NOT NULL DROP TABLE dbo.EvidenceWeightConfig;
-CREATE TABLE dbo.EvidenceWeightConfig(SignalName NVARCHAR(64) PRIMARY KEY,BaseWeight INT NOT NULL,
+CREATE TABLE dbo.EvidenceWeightConfig(
+    SignalName NVARCHAR(64) PRIMARY KEY,
+    BaseWeight INT NOT NULL,
     ContributionType NVARCHAR(16) NOT NULL, -- Support, Contradict, Neutral
     EvidenceTier NVARCHAR(32) NOT NULL, -- Structural, Metadata, Heuristic
     AppliesToCandidate NVARCHAR(32) NOT NULL, -- HO, Region, Composite, Shared, Generated
-    [Description] NVARCHAR(256) NULL --,IsActive BIT NOT NULL DEFAULT 1
+    Description NVARCHAR(256) NULL,
+    IsActive BIT NOT NULL DEFAULT 1
 );
 
 -- Seed weights (Structural > Metadata > Heuristic)
-INSERT INTO dbo.EvidenceWeightConfig(SignalName,BaseWeight,ContributionType,EvidenceTier,AppliesToCandidate,[Description]) VALUES
+INSERT INTO dbo.EvidenceWeightConfig(SignalName,BaseWeight,ContributionType,EvidenceTier,AppliesToCandidate,Description) VALUES
 (N'HO_Column', 50, N'Support', N'Structural', N'HO', N'Explicit HO ownership column'),
 (N'Region_Column', 50, N'Support', N'Structural', N'Region', N'Explicit Region ownership column'),
 (N'Composite_PK', 40, N'Support', N'Structural', N'Composite', N'Composite primary key'),
@@ -576,6 +711,8 @@ DECLARE @MasterSourceDB SYSNAME = dbo.GetMasterSourceDB();
 
 -- Collect structural evidence
 INSERT INTO dbo.OwnershipEvidence(SchemaName, TableName, SignalName, SignalValue, RawConfidence)
+SELECT SchemaName, TableName, SignalName, MAX(SignalValue) AS SignalValue, MAX(RawConfidence) AS RawConfidence
+FROM (
 SELECT ip.SchemaName, ip.TableName, N'HO_Column', CAST(ip.HOColumnCount AS NVARCHAR), 95.00
 FROM dbo.IdentityPlan ip WHERE ip.HOColumnCount > 0
 
@@ -634,11 +771,19 @@ WHERE td.DatabaseName=@TemplateDB AND bev.MatchType=N'CONTAINS'
 
 UNION ALL
 
--- Heuristic evidence
-SELECT cp.SchemaName, cp.TableName,
-       CASE WHEN cp.WinnerCategory IN(N'Master',N'Lookup',N'Configuration') THEN N'Category_Stability' ELSE N'Category_Volatility' END,
-       cp.WinnerCategory, 65.00
-FROM dbo.CategoryPlan cp
+-- Heuristic evidence from metadata only. CategoryPlan is built later and must consume evidence, not feed it.
+SELECT td.SchemaName, td.TableName,
+       CASE
+           WHEN dg.RoughCategory IN(N'Master',N'Lookup') THEN N'Category_Stability'
+           WHEN dg.RoughCategory IN(N'TransactionHeader',N'TransactionDetail') THEN N'Category_Volatility'
+           WHEN td.TableName LIKE N'%Master%' OR td.TableName LIKE N'gen%' OR td.TableName LIKE N'%Type%' OR td.TableName LIKE N'%Status%' THEN N'Category_Stability'
+           ELSE N'Category_Volatility'
+       END,
+       ISNULL(dg.RoughCategory,N'Metadata'), 65.00
+FROM dbo.TableDetails td
+LEFT JOIN dbo.DependencyGraph dg ON dg.SchemaName=td.SchemaName AND dg.TableName=td.TableName
+WHERE td.DatabaseName=@TemplateDB
+  AND (dg.RoughCategory IS NOT NULL OR td.TableName LIKE N'%Master%' OR td.TableName LIKE N'gen%' OR td.TableName LIKE N'%Type%' OR td.TableName LIKE N'%Status%')
 
 UNION ALL
 
@@ -646,7 +791,9 @@ UNION ALL
 SELECT ip.SchemaName, ip.TableName,
        N'IncomingFK_High',
        CAST(ip.TotalIncomingRefs AS NVARCHAR), 85.00
-FROM dbo.IdentityPlan ip WHERE ip.TotalIncomingRefs > 10;
+FROM dbo.IdentityPlan ip WHERE ip.TotalIncomingRefs > 10
+) raw(SchemaName, TableName, SignalName, SignalValue, RawConfidence)
+GROUP BY SchemaName, TableName, SignalName;
 
 DECLARE @evCnt INT = @@ROWCOUNT;
 PRINT N'[PHASE 2.ID.EVIDENCE] Collected ' + CAST(@evCnt AS NVARCHAR) + N' neutral signals.';
@@ -672,7 +819,7 @@ CREATE TABLE dbo.EvidenceScore(
 );
 
 -- Two-pass aggregation for accurate runner-up calculation
-;WITH EffectiveWeights AS (
+WITH EffectiveWeights AS (
     -- Calculate effective weight = BaseWeight × (RawConfidence / 100)
     SELECT
         oe.SchemaName,
@@ -957,14 +1104,73 @@ IF OBJECT_ID('dbo.TableScoreBreakdown','U') IS NOT NULL DROP TABLE dbo.TableScor
 CREATE TABLE dbo.TableScoreBreakdown(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,Category NVARCHAR(32) NOT NULL,SignalName NVARCHAR(64) NOT NULL,SignalValue NVARCHAR(256) NOT NULL,WeightApplied INT NOT NULL,Stance NVARCHAR(16) NULL,Reason NVARCHAR(128) NULL,CONSTRAINT PK_TSB PRIMARY KEY(SchemaName,TableName,Category,SignalName));
 IF OBJECT_ID('dbo.TableScores','U') IS NOT NULL DROP TABLE dbo.TableScores;
 CREATE TABLE dbo.TableScores(SchemaName SYSNAME NOT NULL,TableName SYSNAME NOT NULL,Category NVARCHAR(32) NOT NULL,Score INT NOT NULL,Rank INT NULL,EvidenceStrength INT NULL,ContradictionCount INT NULL,CONSTRAINT PK_TS PRIMARY KEY(SchemaName,TableName,Category));
-IF OBJECT_ID('dbo.EvidenceWeights','U') IS NOT NULL DROP TABLE dbo.EvidenceWeights;
-CREATE TABLE dbo.EvidenceWeights(WeightId INT IDENTITY PRIMARY KEY,SignalName NVARCHAR(64) NOT NULL,Category NVARCHAR(32) NOT NULL,MatchType CHAR(6) NOT NULL,MatchValue NVARCHAR(64) NULL,MinValue FLOAT NULL,MaxValue FLOAT NULL,Weight INT NOT NULL,Reason NVARCHAR(128) NULL);
-INSERT INTO dbo.EvidenceWeights SELECT SignalName,Category,MatchType,MatchValue,MinValue,MaxValue,Weight,Reason FROM dbo.EvidenceWeightConfig WHERE IsActive=1;
-WITH Matched AS(SELECT DISTINCT e.SchemaName,e.TableName,w.Category,w.Weight,w.SignalName,w.Reason,CASE e.SignalType WHEN 'B' THEN CAST(e.BooleanValue AS NVARCHAR) WHEN 'I' THEN CAST(e.IntegerValue AS NVARCHAR) WHEN 'D' THEN CAST(e.DecimalValue AS NVARCHAR) WHEN 'S' THEN e.StringValue END AS Val FROM dbo.TableEvidence e JOIN dbo.EvidenceWeights w ON e.SignalName=w.SignalName WHERE(w.MatchType='EQ' AND((e.SignalType='B' AND CAST(e.BooleanValue AS NVARCHAR)=w.MatchValue)OR(e.SignalType='I' AND CAST(e.IntegerValue AS NVARCHAR)=w.MatchValue)OR(e.SignalType='S' AND e.StringValue=w.MatchValue)))OR(w.MatchType='GT' AND e.SignalType IN('I','D')AND COALESCE(e.IntegerValue,CAST(e.DecimalValue AS INT))>w.MinValue)),
-Collapsed AS(SELECT SchemaName,TableName,Category,SignalName,MAX(Val)AS Val,SUM(Weight)AS Weight,MAX(Reason)AS Reason FROM Matched GROUP BY SchemaName,TableName,Category,SignalName)
-INSERT INTO dbo.TableScoreBreakdown SELECT SchemaName,TableName,Category,SignalName,Val,Weight,CASE WHEN Weight>0 THEN N'SUPPORTS' ELSE N'CONTRADICTS' END,Reason FROM Collapsed;
-WITH Scores AS(SELECT SchemaName,TableName,Category,SUM(WeightApplied)AS Score,SUM(ABS(WeightApplied))AS EvidenceStrength,ROW_NUMBER()OVER(PARTITION BY SchemaName,TableName ORDER BY SUM(WeightApplied)DESC)AS Rank FROM dbo.TableScoreBreakdown GROUP BY SchemaName,TableName,Category)
-INSERT INTO dbo.TableScores SELECT SchemaName,TableName,Category,Score,Rank,EvidenceStrength,0 FROM Scores;
+DECLARE @TemplateDB SYSNAME=dbo.GetTemplateDB();
+;WITH CategorySignals AS (
+    SELECT td.SchemaName,td.TableName,N'Lookup' AS Category,N'GraphLookup' AS SignalName,ISNULL(dg.RoughCategory,N'') AS SignalValue,35 AS WeightApplied,N'Graph shape suggests lookup/reference data.' AS Reason
+    FROM dbo.TableDetails td JOIN dbo.DependencyGraph dg ON dg.SchemaName=td.SchemaName AND dg.TableName=td.TableName
+    WHERE td.DatabaseName=@TemplateDB AND dg.RoughCategory=N'Lookup'
+    UNION ALL
+    SELECT td.SchemaName,td.TableName,N'Master',N'GraphMaster',ISNULL(dg.RoughCategory,N''),35,N'Graph shape suggests master data.'
+    FROM dbo.TableDetails td JOIN dbo.DependencyGraph dg ON dg.SchemaName=td.SchemaName AND dg.TableName=td.TableName
+    WHERE td.DatabaseName=@TemplateDB AND dg.RoughCategory=N'Master'
+    UNION ALL
+    SELECT td.SchemaName,td.TableName,N'TransactionHeader',N'GraphHeader',ISNULL(dg.RoughCategory,N''),35,N'Graph shape suggests transaction header.'
+    FROM dbo.TableDetails td JOIN dbo.DependencyGraph dg ON dg.SchemaName=td.SchemaName AND dg.TableName=td.TableName
+    WHERE td.DatabaseName=@TemplateDB AND dg.RoughCategory=N'TransactionHeader'
+    UNION ALL
+    SELECT td.SchemaName,td.TableName,N'TransactionDetail',N'GraphDetail',ISNULL(dg.RoughCategory,N''),35,N'Graph shape suggests transaction detail.'
+    FROM dbo.TableDetails td JOIN dbo.DependencyGraph dg ON dg.SchemaName=td.SchemaName AND dg.TableName=td.TableName
+    WHERE td.DatabaseName=@TemplateDB AND dg.RoughCategory=N'TransactionDetail'
+    UNION ALL
+    SELECT te.SchemaName,te.TableName,N'Configuration',N'SmallConfigTable',N'1',25,N'Small stable table from metadata evidence.'
+    FROM dbo.TableEvidence te WHERE te.SignalName=N'SmallConfigTable' AND ISNULL(te.BooleanValue,0)=1
+    UNION ALL
+    SELECT te.SchemaName,te.TableName,N'TransactionDetail',N'HasBranchId',N'1',20,N'Branch-scoped table usually belongs to regional/transaction data.'
+    FROM dbo.TableEvidence te WHERE te.SignalName=N'HasBranchId' AND ISNULL(te.BooleanValue,0)=1
+    UNION ALL
+    SELECT te.SchemaName,te.TableName,N'TransactionDetail',N'CompositePK',N'1',15,N'Composite key commonly indicates child or branch-scoped data.'
+    FROM dbo.TableEvidence te WHERE te.SignalName=N'CompositePK' AND ISNULL(te.BooleanValue,0)=1
+    UNION ALL
+    SELECT ip.SchemaName,ip.TableName,N'Master',N'OwnerHO',ip.IdentityOwner,30,N'Identity owner resolved to HO.'
+    FROM dbo.IdentityPlan ip WHERE ip.IdentityOwner=N'HO'
+    UNION ALL
+    SELECT ip.SchemaName,ip.TableName,N'TransactionDetail',N'OwnerRegion',ip.IdentityOwner,25,N'Identity owner resolved to Region.'
+    FROM dbo.IdentityPlan ip WHERE ip.IdentityOwner=N'Region'
+    UNION ALL
+    SELECT ip.SchemaName,ip.TableName,N'Lookup',N'OwnerShared',ip.IdentityOwner,25,N'Shared identity usually merges as lookup/reference data.'
+    FROM dbo.IdentityPlan ip WHERE ip.IdentityOwner=N'Shared'
+    UNION ALL
+    SELECT es.SchemaName,es.TableName,
+           CASE es.OwnerCandidate WHEN N'HO' THEN N'Master' WHEN N'Shared' THEN N'Lookup' WHEN N'Composite' THEN N'TransactionDetail' WHEN N'Region' THEN N'TransactionDetail' ELSE N'Unknown' END,
+           N'OwnershipEvidence',es.OwnerCandidate,CAST(ISNULL(es.Confidence,50)/4 AS INT),N'Neutral ownership evidence converted to weak category signal.'
+    FROM dbo.EvidenceScore es
+    UNION ALL
+    SELECT td.SchemaName,td.TableName,
+           CASE bev.EntityClass WHEN N'Master' THEN N'Master' WHEN N'Location' THEN N'Lookup' WHEN N'Organisation' THEN N'Master' WHEN N'Party' THEN N'Master' WHEN N'Transaction' THEN N'TransactionHeader' ELSE N'Unknown' END,
+           N'BusinessEntityVocabulary',bev.EntityName,20,N'Table name matched business entity vocabulary.'
+    FROM dbo.TableDetails td JOIN dbo.BusinessEntityVocabulary bev ON td.TableName LIKE bev.TablePattern
+    WHERE td.DatabaseName=@TemplateDB AND bev.MatchType=N'CONTAINS'
+)
+INSERT INTO dbo.TableScoreBreakdown(SchemaName,TableName,Category,SignalName,SignalValue,WeightApplied,Stance,Reason)
+SELECT SchemaName,TableName,Category,SignalName,MAX(SignalValue),SUM(WeightApplied),
+       CASE WHEN SUM(WeightApplied)>=0 THEN N'SUPPORTS' ELSE N'CONTRADICTS' END,MAX(Reason)
+FROM CategorySignals
+WHERE Category<>N'Unknown'
+GROUP BY SchemaName,TableName,Category,SignalName;
+
+;WITH Scores AS(
+    SELECT SchemaName,TableName,Category,SUM(WeightApplied) AS Score,SUM(ABS(WeightApplied)) AS EvidenceStrength,
+           ROW_NUMBER()OVER(PARTITION BY SchemaName,TableName ORDER BY SUM(WeightApplied) DESC, COUNT(*) DESC, Category) AS Rank
+    FROM dbo.TableScoreBreakdown GROUP BY SchemaName,TableName,Category
+)
+INSERT INTO dbo.TableScores(SchemaName,TableName,Category,Score,Rank,EvidenceStrength,ContradictionCount)
+SELECT SchemaName,TableName,Category,Score,Rank,EvidenceStrength,0 FROM Scores;
+
+INSERT INTO dbo.TableScores(SchemaName,TableName,Category,Score,Rank,EvidenceStrength,ContradictionCount)
+SELECT td.SchemaName,td.TableName,N'Unknown',0,1,0,0
+FROM dbo.TableDetails td
+WHERE td.DatabaseName=@TemplateDB
+  AND NOT EXISTS(SELECT 1 FROM dbo.TableScores ts WHERE ts.SchemaName=td.SchemaName AND ts.TableName=td.TableName);
 GO
 
 PRINT N'[PHASE 1D] Category Plan...';
@@ -1124,8 +1330,11 @@ PRINT @msg;
 DECLARE @MasterSourceDB SYSNAME=dbo.GetMasterSourceDB();
 
 
--- MILESTONE 2: V10 CONFIDENCE-BASED INFERENCE ENGINE (ADDITIVE). PHASE 2.ID has populated IdentityPlan
-PRINT N'[MILESTONE 2] V10 Confidence-Based Inference Engine...';
+-- MILESTONE 2: V10 CONFIDENCE-BASED INFERENCE ENGINE (DISABLED).
+-- The neutral ownership evidence engine above is now authoritative. V10 is retained only as reference text
+-- in this script and must not mutate IdentityPlan or produce competing ownership evidence.
+IF 1=0 BEGIN
+PRINT N'[MILESTONE 2] V10 Confidence-Based Inference Engine disabled.';
 
 
 -- V10.1: Infrastructure tables
@@ -1441,6 +1650,7 @@ CASE WHEN ISNULL(100.0 * SUM(CASE WHEN ClassificationTier = N'UNKNOWN' THEN 1 EL
 N'Percentage of UNKNOWN classification'
 FROM dbo.IdentityPlan WHERE V10Winner IS NOT NULL;
 PRINT N'[MILESTONE 2] V10 Inference Engine Complete.';
+END
 GO
 PRINT N'[PHASE 2.STR] Strategy Plan...';
 IF OBJECT_ID('dbo.StrategyRule','U') IS NOT NULL DROP TABLE dbo.StrategyRule;
@@ -2112,6 +2322,25 @@ FROM dbo.MigrationExecutionContract c WHERE c.IsUnsupported=0 AND c.GovernanceSt
 INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
 SELECT @RunId,N'TranslationCompleteness',N'WARNING',c.SchemaName,c.TableName,N'Method='+c.MigrationMethod+N' but no TranslationPlan.'
 FROM dbo.MigrationExecutionContract c WHERE c.IsUnsupported=0 AND c.GovernanceStatus NOT IN(N'PENDING_REVIEW',N'REJECTED') AND c.MigrationMethod NOT IN(N'PRESERVE',N'INSERT_ONLY',N'OVERWRITE') AND NOT EXISTS(SELECT 1 FROM dbo.TranslationPlan tp WHERE tp.SchemaName=c.SchemaName AND tp.TableName=c.TableName);
+-- Check 9: Essential planning tables must contain data. A run with zero plans is not READY.
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'PlannerPopulation',N'ERROR',NULL,NULL,N'IdentityPlan has zero rows.'
+WHERE NOT EXISTS(SELECT 1 FROM dbo.IdentityPlan);
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'PlannerPopulation',N'ERROR',NULL,NULL,N'CategoryPlan has zero rows.'
+WHERE NOT EXISTS(SELECT 1 FROM dbo.CategoryPlan);
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'PlannerPopulation',N'ERROR',NULL,NULL,N'StrategyPlan has zero rows.'
+WHERE NOT EXISTS(SELECT 1 FROM dbo.StrategyPlan);
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'PlannerPopulation',N'ERROR',NULL,NULL,N'MigrationAnalysis has zero rows.'
+WHERE NOT EXISTS(SELECT 1 FROM dbo.MigrationAnalysis);
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'PlannerPopulation',N'ERROR',NULL,NULL,N'MigrationExecutionContract has zero rows.'
+WHERE NOT EXISTS(SELECT 1 FROM dbo.MigrationExecutionContract);
+INSERT INTO dbo.MigrationReadinessDetail(RunId,CheckName,Severity,SchemaName,TableName,Message)
+SELECT @RunId,N'PlannerPopulation',N'ERROR',NULL,NULL,N'ExecutionManifest has zero active entries.'
+WHERE NOT EXISTS(SELECT 1 FROM dbo.ExecutionManifest WHERE Status=N'Active');
 DECLARE @ErrCnt INT=(SELECT COUNT(*) FROM dbo.MigrationReadinessDetail WHERE RunId=@RunId AND Severity=N'ERROR');
 DECLARE @WrnCnt INT=(SELECT COUNT(*) FROM dbo.MigrationReadinessDetail WHERE RunId=@RunId AND Severity=N'WARNING');
 DECLARE @RdyStatus NVARCHAR(16)=CASE WHEN @ErrCnt>0 THEN N'BLOCKED' ELSE N'READY' END;
